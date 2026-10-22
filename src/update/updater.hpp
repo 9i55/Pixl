@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <bcrypt.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 #pragma comment(lib, "wininet.lib")
@@ -113,6 +114,41 @@ inline bool latest(Latest& out) {
     out.version = Version::parse(tag);
     out.tag.assign(tag.begin(), tag.end());
     return out.version.valid;
+}
+
+inline bool jsonTrue(const std::string& json, const char* key) {
+    const std::string tag = std::string("\"") + key + "\"";
+    size_t at = json.find(tag);
+    if (at == std::string::npos) return false;
+    at = json.find(':', at + tag.size());
+    if (at == std::string::npos) return false;
+    at = json.find_first_not_of(" \t\r\n", at + 1);
+    return at != std::string::npos && json.compare(at, 4, "true") == 0;
+}
+
+inline std::wstring wide(const std::string& utf8) {
+    if (utf8.empty()) return L"";
+    const int n = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), nullptr, 0);
+    std::wstring out((size_t)std::max(n, 0), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, utf8.data(), (int)utf8.size(), out.data(), n);
+    return out;
+}
+
+// control.json in the repo lets the developer turn Pixl off for everyone, or require a
+// minimum version (older copies must update before they can be used).
+struct Control {
+    bool disabled = false;
+    Version minVersion;
+    std::wstring message;
+};
+
+inline bool control(Control& out) {
+    std::string body;
+    if (!fetch(L"https://raw.githubusercontent.com/" PIXL_REPO L"/main/control.json", &body, L"", 64 * 1024)) return false;
+    out.disabled = jsonTrue(body, "disabled");
+    out.minVersion = Version::parse(jsonString(body, "minVersion"));
+    out.message = wide(jsonString(body, "message"));
+    return true;
 }
 
 inline std::string sha256File(const std::wstring& path) {

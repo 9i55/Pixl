@@ -13354,19 +13354,42 @@ static void ghostClear() {
     dropStop();
 }
 
-// Looks for a newer release a few seconds after start, then every six hours.
+static const UINT WM_UPD_BLOCKED = WM_APP + 63, WM_UPD_FORCED = WM_APP + 64;
+static update::Control updControl;  // written by the watcher before it posts WM_UPD_BLOCKED or WM_UPD_FORCED
+static bool updForced = false;
+
+// Reads control.json right away and every 30 minutes (off switch, minimum version), and looks
+// for a newer release a few seconds after start, then every six hours. Offline, Pixl just runs.
 static void updWatch(HWND owner) {
     std::thread([owner] {
-        Sleep(5000);
-        for (;;) {
-            update::Latest l;
-            if (updState.load() == 0 && update::latest(l) && l.version.newerThan(update::current())) {
-                updLatest = l;
-                updState = 1;
-                PostMessageW(owner, WM_UPD_FOUND, 0, 0);
-                return;
+        const update::Version me = update::current();
+        for (int round = 0;; ++round) {
+            update::Control c;
+            if (update::control(c)) {
+                if (c.disabled) {
+                    updControl = c;
+                    PostMessageW(owner, WM_UPD_BLOCKED, 0, 0);
+                    return;
+                }
+                update::Latest l;
+                if (c.minVersion.valid && c.minVersion.newerThan(me) && updState.load() <= 1 && update::latest(l) && l.version.newerThan(me)) {
+                    if (updState.load() == 0) updLatest = l;
+                    updControl = c;
+                    updState = 1;
+                    PostMessageW(owner, WM_UPD_FORCED, 0, 0);
+                    return;
+                }
             }
-            Sleep(6 * 60 * 60 * 1000);
+            if (round == 0) Sleep(5000);
+            if (round % 12 == 0 && updState.load() == 0) {
+                update::Latest l;
+                if (update::latest(l) && l.version.newerThan(me)) {
+                    updLatest = l;
+                    updState = 1;
+                    PostMessageW(owner, WM_UPD_FOUND, 0, 0);
+                }
+            }
+            Sleep(30 * 60 * 1000);
         }
     }).detach();
 }
@@ -13375,10 +13398,38 @@ static std::wstring updDownloadPath() { return exeFolder() + L"\\Pixl.update.exe
 static std::wstring updOldPath() { return exeFolder() + L"\\Pixl.old.exe"; }
 static std::wstring updWhy;
 
+static void updBegin(HWND h);
+
 static void updStart(HWND h) {
     const std::wstring ask = L"Pixl " + updLatest.version.text() + L" is ready (you have " + update::current().text() +
                              L").\n\nDownload it and restart Pixl now? Your settings stay as they are.";
     if (MessageBoxW(h, ask.c_str(), L"Update Pixl", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    updBegin(h);
+}
+
+// The developer turned Pixl off in control.json: say so and close.
+static void updBlocked(HWND h) {
+    const std::wstring text = updControl.message.empty() ? L"Pixl has been turned off by its developer for now. Please try again later."
+                                                         : updControl.message;
+    MessageBoxW(h, text.c_str(), L"Pixl", MB_OK | MB_ICONINFORMATION);
+    DestroyWindow(h);
+}
+
+// This version is below control.json's minimum: update now, or close.
+static void updMustUpdate(HWND h) {
+    updForced = true;
+    InvalidateRect(h, nullptr, FALSE);
+    std::wstring text = L"This version of Pixl (" + update::current().text() + L") can't be used anymore.\n\n";
+    if (!updControl.message.empty()) text += updControl.message + L"\n\n";
+    text += L"Press OK to update to Pixl " + updLatest.version.text() + L" now. Your settings stay as they are.";
+    if (MessageBoxW(h, text.c_str(), L"Update required", MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+        DestroyWindow(h);
+        return;
+    }
+    updBegin(h);
+}
+
+static void updBegin(HWND h) {
     updState = 2;
     InvalidateRect(h, nullptr, FALSE);
     const update::Latest l = updLatest;
@@ -13397,6 +13448,7 @@ static void updFinish(HWND h, bool downloaded) {
         InvalidateRect(h, nullptr, FALSE);
         const std::wstring text = why + L"\n\nYou can also download it from github.com/" PIXL_REPO L"/releases";
         MessageBoxW(h, text.c_str(), L"Update Pixl", MB_OK | MB_ICONWARNING);
+        if (updForced) DestroyWindow(h);  // this version may not be used, so don't stay open
     };
     if (!downloaded) { fail(updWhy); return; }
     wchar_t exe[MAX_PATH];
@@ -13510,6 +13562,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_UPD_FOUND:
         InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_UPD_BLOCKED:
+        updBlocked(h);
+        return 0;
+    case WM_UPD_FORCED:
+        updMustUpdate(h);
         return 0;
     case WM_UPD_DONE:
         updFinish(h, w != 0);
