@@ -5833,6 +5833,35 @@ static void startupFollow() {
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     if (on && _wcsicmp(cmd, (L"\"" + std::wstring(exe) + L"\"").c_str()) != 0) startupSet(true);
 }
+// Windows' search only lists apps that are in the Start menu: Pixl keeps its own entry there, pointing at wherever
+// it runs from (written again only when it is missing or points elsewhere, e.g. after the folder moved).
+static void startMenuFollow() {
+    wchar_t exe[MAX_PATH] = L"";
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return;
+    PWSTR programs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs))) return;
+    const std::wstring lnk = std::wstring(programs) + L"\\Pixl.lnk";
+    CoTaskMemFree(programs);
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)))) return;
+    IPersistFile* file = nullptr;
+    if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file)))) {
+        wchar_t current[MAX_PATH] = L"";
+        const bool same = SUCCEEDED(file->Load(lnk.c_str(), STGM_READ)) &&
+                          SUCCEEDED(link->GetPath(current, MAX_PATH, nullptr, 0)) && _wcsicmp(current, exe) == 0;
+        if (!same) {
+            std::wstring folder(exe);
+            folder.resize(folder.find_last_of(L'\\'));
+            link->SetPath(exe);
+            link->SetWorkingDirectory(folder.c_str());
+            link->SetIconLocation(exe, 0);
+            link->SetDescription(L"Pixl Audio Effects Console");
+            file->Save(lnk.c_str(), TRUE);
+        }
+        file->Release();
+    }
+    link->Release();
+}
 static bool settingsKept() {
     HKEY hk;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS) return false;
@@ -15165,6 +15194,7 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     rememberCopyFolder(exeFolder());
 #ifndef PIXL_PREVIEW
     if (startupOn) startupFollow();
+    if (SUCCEEDED(com)) startMenuFollow();
 #endif
 
     WNDCLASSW wc{};
