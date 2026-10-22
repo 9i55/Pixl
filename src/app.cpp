@@ -1671,7 +1671,9 @@ static void audioThread() {
 
 static const int COL_W = 566;
 static const int CX    = COL_W - 12;
-static const int WIN_W = COL_W + CX, WIN_H = 756;
+static const int WIN_W = COL_W + CX;
+static const int WIN_H_FULL = 756;
+static int WIN_H = WIN_H_FULL;  // shrinks when sections are hidden (Edit layout)
 static const int TITLE_H = 34;
 static const int STATUS_H = 34;
 
@@ -1742,6 +1744,20 @@ static LPARAM designPt(LPARAM l) {
     return MAKELPARAM((WORD)(short)x, (WORD)(short)y);
 }
 
+// Main window sections can be hidden and moved (Edit layout). The code places everything at its
+// home position; these map between that and where it shows on screen.
+static bool layoutWindow(HWND h);   // the main window, showing its sections
+static POINT layoutIn(POINT shown); // a point on screen -> its home position (far away when it hits nothing)
+static bool layoutOut(RECT& r);     // a home rect -> where it shows; false when its section is hidden
+static bool layoutMouse(HWND h, UINT m, POINT shown);  // Edit layout handles the mouse itself
+
+static LPARAM mainDesignPt(HWND h, LPARAM l) {
+    LPARAM d = designPt(l);
+    if (!layoutWindow(h)) return d;
+    const POINT p = layoutIn(POINT{(short)LOWORD(d), (short)HIWORD(d)});
+    return MAKELPARAM((WORD)(short)p.x, (WORD)(short)p.y);
+}
+
 static bool modalNext(MSG& msg) {
     const BOOL got = GetMessageW(&msg, nullptr, 0, 0);
     if (got > 0) return true;
@@ -1754,7 +1770,7 @@ static POINT wheelPoint(HWND h, LPARAM l) {
     ScreenToClient(h, &p);
     p.x = unsc(p.x);
     p.y = unsc(p.y);
-    return p;
+    return layoutWindow(h) ? layoutIn(p) : p;
 }
 
 static double fadeBegin(HWND h, UINT m, WPARAM w, LPARAM l);
@@ -1785,14 +1801,19 @@ static LRESULT CALLBACK scaledProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     const double outer = fadeBegin(h, m, w, l);
     const bool watch = hoverWatch(h, m, w);
-    const LRESULT r = Proc(h, m, w, mouseMsg(m) ? designPt(l) : l);
+    LRESULT r = 0;
+    const LPARAM shown = designPt(l);
+    if (mouseMsg(m) && layoutWindow(h) && layoutMouse(h, m, POINT{(short)LOWORD(shown), (short)HIWORD(shown)})) r = 0;
+    else r = Proc(h, m, w, mouseMsg(m) ? mainDesignPt(h, l) : l);
     fadeEnd(outer);
     if (watch) hoverFade(h);
     return r;
 }
 
-static void invalidateDesign(HWND h, const RECT& r) {
-    if (IsRectEmpty(&r)) return;
+static void invalidateDesign(HWND h, const RECT& at) {
+    if (IsRectEmpty(&at)) return;
+    RECT r = at;
+    if (layoutWindow(h) && !layoutOut(r)) return;
     RECT d = scRect(r);
     InflateRect(&d, 2, 2);
     InvalidateRect(h, &d, FALSE);
@@ -2431,7 +2452,8 @@ static int clipLevelFromOld(int old) {
 static const RECT R_CLOSE  = {WIN_W - 34, 5, WIN_W - 8, 29};
 static const RECT R_MIN    = {WIN_W - 64, 5, WIN_W - 38, 29};
 static const RECT R_GEAR   = {WIN_W - 94, 5, WIN_W - 68, 29};
-static const RECT R_GRIP   = {WIN_W - 16, WIN_H - 16, WIN_W - 2, WIN_H - 2};
+static RECT R_GRIP   = {WIN_W - 16, WIN_H_FULL - 16, WIN_W - 2, WIN_H_FULL - 2};  // follows WIN_H
+static RECT R_STATUS_LINE = {0, WIN_H_FULL - STATUS_H, WIN_W, WIN_H_FULL};  // follows WIN_H
 
 static const int PRESET_X   = 24;
 static const int PRESET_Y   = 208;
@@ -10401,6 +10423,315 @@ static void openMixer(HWND owner) {
 
 static const int REC_Y = CLIP_Y + 296;
 static const RECT R_REC_PANEL = {CX + 12, REC_Y, CX + COL_W - 12, CLIP_Y + CLIP_H};
+
+// Edit layout: the main window is made of sections the user can hide, move up or down, or move to the
+// other column. Everything is still placed at its home position in the code; a section is drawn and
+// clicked through an offset, and the window grows or shrinks to fit what is shown.
+enum { SEC_DEVICES, SEC_ROOM, SEC_VOICE, SEC_EQ, SEC_CLIP, SEC_APP, SEC_REC, SEC_COUNT };
+struct LayoutSection { const wchar_t* name; RECT home; int column; };
+static const LayoutSection SECTIONS[SEC_COUNT] = {
+    {L"Devices", {12, TITLE_H + 12, COL_W - 12, TITLE_H + 136}, 0},
+    {L"Environment", {12, TITLE_H + 146, COL_W - 12, TITLE_H + 444}, 0},
+    {L"Voice mask", {12, VOICE_Y, COL_W - 12, VOICE_Y + VOICE_H}, 0},
+    {L"Equalizer", {CX + 12, EQ_Y, CX + COL_W - 12, EQ_Y + EQ_H}, 1},
+    {L"Sound clip", {CX + 12, CLIP_Y, CX + COL_W - 12, CLIP_Y + 160}, 1},
+    {L"Program on the mic", {CX + 12, CLIP_Y + 160, CX + COL_W - 12, REC_Y}, 1},
+    {L"Recorder", {CX + 12, REC_Y, CX + COL_W - 12, CLIP_Y + CLIP_H}, 1},
+};
+static std::vector<int> layoutCols[2];
+static bool layoutHidden[SEC_COUNT] = {};
+static bool layoutEditing = false;
+static POINT layoutShift[SEC_COUNT] = {};
+static bool layoutShown[SEC_COUNT] = {};
+static int layoutHot = -1;  // edit control under the mouse: section * 4 + button
+static const RECT R_LAYOUT = {WIN_W - 822, 5, WIN_W - 792, 29};
+static const RECT R_LAYOUT_RESET = {96, 5, 196, 29};
+enum { LAY_UP, LAY_DOWN, LAY_MOVE, LAY_HIDE, LAY_COUNT };
+
+static void placeChildren();
+static void tipsPlace();
+static void applyLayout();
+static void dropMainBuffer();
+
+static bool layoutWindow(HWND h) { return h && h == hwndMain && !cablePanel; }
+
+static void layoutDefault() {
+    layoutCols[0].clear();
+    layoutCols[1].clear();
+    for (int s = 0; s < SEC_COUNT; ++s) {
+        layoutCols[SECTIONS[s].column].push_back(s);
+        layoutHidden[s] = false;
+    }
+}
+
+static bool layoutIsDefault() {
+    for (int s = 0; s < SEC_COUNT; ++s) if (layoutHidden[s]) return false;
+    int s = 0;
+    for (int c = 0; c < 2; ++c)
+        for (int v : layoutCols[c]) if (v != s++ || SECTIONS[v].column != c) return false;
+    return true;
+}
+
+// Saved as "0,1,2|3,4,5,6|5": left column, right column, hidden sections.
+static void layoutLoad() {
+    layoutDefault();
+    wchar_t buf[128] = {};
+    DWORD cb = sizeof buf - sizeof(wchar_t);
+    if (RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, L"Layout", RRF_RT_REG_SZ, nullptr, buf, &cb) != ERROR_SUCCESS) return;
+    std::vector<int> cols[2], hidden;
+    int part = 0;
+    bool seen[SEC_COUNT] = {};
+    for (const wchar_t* p = buf; *p; ++p) {
+        if (*p == L'|') { if (++part > 2) break; continue; }
+        if (*p < L'0' || *p > L'9') continue;
+        const int s = *p - L'0';
+        if (s >= SEC_COUNT) continue;
+        if (part < 2 && !seen[s]) { cols[part].push_back(s); seen[s] = true; }
+        else if (part == 2) hidden.push_back(s);
+    }
+    for (int s = 0; s < SEC_COUNT; ++s) if (!seen[s]) cols[SECTIONS[s].column].push_back(s);  // added in a later version
+    layoutCols[0] = cols[0];
+    layoutCols[1] = cols[1];
+    for (int s : hidden) layoutHidden[s] = true;
+}
+
+static void layoutSave() {
+    std::wstring v;
+    for (int c = 0; c < 2; ++c) {
+        for (int s : layoutCols[c]) v += (wchar_t)(L'0' + s);
+        v += L'|';
+    }
+    for (int s = 0; s < SEC_COUNT; ++s) if (layoutHidden[s]) v += (wchar_t)(L'0' + s);
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hk, nullptr) != ERROR_SUCCESS) return;
+    RegSetValueExW(hk, L"Layout", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hk);
+}
+
+static RECT layoutShownRect(int s) {
+    RECT r = SECTIONS[s].home;
+    OffsetRect(&r, layoutShift[s].x, layoutShift[s].y);
+    return r;
+}
+
+// Stacks each column's shown sections from the top; sections that were joined at home stay joined.
+static void layoutCompute() {
+    int bottom = TITLE_H + 12;
+    for (int c = 0; c < 2; ++c) {
+        int y = TITLE_H + 12, prev = -1;
+        const int x = c == 0 ? 12 : CX + 12;
+        for (int s : layoutCols[c]) {
+            layoutShown[s] = layoutEditing || !layoutHidden[s];
+            if (!layoutShown[s]) continue;
+            const RECT& h = SECTIONS[s].home;
+            if (prev >= 0) y += SECTIONS[prev].home.bottom == h.top ? 0 : 10;
+            layoutShift[s] = {x - h.left, y - h.top};
+            y += h.bottom - h.top;
+            prev = s;
+        }
+        bottom = std::max(bottom, y);
+    }
+    WIN_H = std::max(bottom, TITLE_H + 160) + 8 + STRIP_H + STATUS_H;
+    R_GRIP = {WIN_W - 16, WIN_H - 16, WIN_W - 2, WIN_H - 2};
+    R_STATUS_LINE = {0, WIN_H - STATUS_H, WIN_W, WIN_H};
+}
+
+static void layoutApply() {
+    layoutCompute();
+    if (!hwndMain) return;
+    dropMainBuffer();
+    SetWindowPos(hwndMain, nullptr, 0, 0, sc(WIN_W), sc(WIN_H), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    buildBackground();
+    placeChildren();
+    tipsPlace();
+    applyLayout();
+    InvalidateRect(hwndMain, nullptr, TRUE);
+}
+
+static int layoutSectionAt(POINT home) {
+    for (int s = 0; s < SEC_COUNT; ++s)
+        if (PtInRect(&SECTIONS[s].home, home)) return s;
+    return -1;
+}
+
+// The title bar, the level strip and the status bar stay put; everything else lives in a section.
+static bool layoutFixedArea(POINT shown) { return shown.y < TITLE_H || shown.y >= stripRect().top; }
+
+static POINT layoutIn(POINT shown) {
+    if (layoutFixedArea(shown)) return shown;
+    for (int s = 0; s < SEC_COUNT; ++s) {
+        if (!layoutShown[s]) continue;
+        const RECT r = layoutShownRect(s);
+        if (!PtInRect(&r, shown)) continue;
+        if (layoutEditing) return POINT{-30000, -30000};  // while editing, the controls inside don't react
+        return POINT{shown.x - layoutShift[s].x, shown.y - layoutShift[s].y};
+    }
+    return layoutSectionAt(shown) >= 0 ? POINT{-30000, -30000} : shown;  // empty space hits nothing
+}
+
+static bool layoutOut(RECT& r) {
+    const int s = layoutSectionAt(POINT{r.left, r.top});
+    if (s < 0) return true;
+    if (!layoutShown[s]) return false;
+    OffsetRect(&r, layoutShift[s].x, layoutShift[s].y);
+    return true;
+}
+
+static bool layoutChildShown(int x, int y) {
+    const int s = layoutSectionAt(POINT{x, y});
+    return !layoutEditing && (s < 0 || layoutShown[s]);
+}
+
+static RECT layoutButton(int s, int b) {
+    const RECT d = layoutShownRect(s);
+    static const int W[LAY_COUNT] = {44, 54, 60, 58};
+    int right = d.right - 10;
+    for (int k = LAY_COUNT - 1; k > b; --k) right -= W[k] + 6;
+    return {right - W[b], d.top + 8, right, d.top + 32};
+}
+
+static void layoutMoveWithin(int s, int by) {
+    for (auto& col : layoutCols) {
+        auto it = std::find(col.begin(), col.end(), s);
+        if (it == col.end()) continue;
+        const int i = (int)(it - col.begin()), j = i + by;
+        if (j >= 0 && j < (int)col.size()) std::swap(col[i], col[j]);
+        return;
+    }
+}
+
+static void layoutSwapColumn(int s) {
+    for (int c = 0; c < 2; ++c) {
+        auto it = std::find(layoutCols[c].begin(), layoutCols[c].end(), s);
+        if (it == layoutCols[c].end()) continue;
+        const int i = (int)(it - layoutCols[c].begin());
+        layoutCols[c].erase(it);
+        auto& other = layoutCols[1 - c];
+        other.insert(other.begin() + std::min(i, (int)other.size()), s);
+        return;
+    }
+}
+
+static void layoutSetEditing(bool on) {
+    layoutEditing = on;
+    layoutHot = -1;
+    layoutApply();
+}
+
+static void layoutReset() {
+    layoutDefault();
+    layoutSave();
+    layoutApply();
+}
+
+static bool layoutMouse(HWND h, UINT m, POINT shown) {
+    if (!layoutEditing || layoutFixedArea(shown)) return false;
+    int hit = -1, inside = -1;
+    for (int s = 0; s < SEC_COUNT && hit < 0; ++s) {
+        if (!layoutShown[s]) continue;
+        const RECT r = layoutShownRect(s);
+        if (!PtInRect(&r, shown)) continue;
+        inside = s;
+        for (int b = 0; b < LAY_COUNT; ++b) {
+            const RECT br = layoutButton(s, b);
+            if (PtInRect(&br, shown)) { hit = s * LAY_COUNT + b; break; }
+        }
+    }
+    if (m == WM_MOUSEMOVE && hit != layoutHot) {
+        layoutHot = hit;
+        InvalidateRect(h, nullptr, FALSE);
+    }
+    if (m == WM_LBUTTONDOWN && hit >= 0) {
+        const int s = hit / LAY_COUNT;
+        switch (hit % LAY_COUNT) {
+        case LAY_UP: layoutMoveWithin(s, -1); break;
+        case LAY_DOWN: layoutMoveWithin(s, 1); break;
+        case LAY_MOVE: layoutSwapColumn(s); break;
+        case LAY_HIDE: layoutHidden[s] = !layoutHidden[s]; break;
+        }
+        layoutSave();
+        layoutApply();
+    }
+    return inside >= 0 || m == WM_LBUTTONDOWN || m == WM_LBUTTONDBLCLK;  // nothing inside a section reacts while editing
+}
+
+// Draws one section through its offset, clipped to itself.
+static void drawDevices(HDC dc);
+static void drawRoom(HDC dc);
+static void drawRecorder(HDC dc);
+static void drawEqPanel(HDC dc);
+static void drawPresetScrollbar(HDC dc);
+
+static void drawSections(HDC dc) {
+    XFORM base{};
+    GetWorldTransform(dc, &base);
+    for (int s = 0; s < SEC_COUNT; ++s) {
+        if (!layoutShown[s]) continue;
+        const int saved = SaveDC(dc);
+        XFORM x = base;
+        x.eDx += base.eM11 * layoutShift[s].x;
+        x.eDy += base.eM22 * layoutShift[s].y;
+        SetWorldTransform(dc, &x);
+        const RECT& home = SECTIONS[s].home;
+        IntersectClipRect(dc, home.left, home.top, home.right, home.bottom);
+        if (RectVisible(dc, &home)) {
+            switch (s) {
+            case SEC_DEVICES: drawDevices(dc); break;
+            case SEC_ROOM: {
+                drawRoom(dc);
+                PixelSnap px(dc);
+                RECT presetBox = px.map(RECT{PRESET_X, PRESET_Y, PRESET_X + PRESET_LW, PRESET_Y + PRESET_H});
+                InflateRect(&presetBox, px.line(), px.line());
+                edgeLines(dc, presetBox, px.line(), C_EDGE);
+                break;
+            }
+            case SEC_REC: drawEqPanel(dc); drawRecorder(dc); break;
+            default: drawEqPanel(dc); break;
+            }
+            if (s == SEC_ROOM) {
+                SetWorldTransform(dc, &x);
+                drawPresetScrollbar(dc);
+            }
+            // Sound clip, Program and Recorder share one panel at home; close it off where a
+            // neighbour moved away.
+            if (s == SEC_CLIP || s == SEC_APP || s == SEC_REC) {
+                SetWorldTransform(dc, &x);
+                PixelSnap px(dc);
+                const RECT d = px.map(home);
+                HBRUSH b = CreateSolidBrush(C_EDGE);
+                const int t = px.line();
+                const RECT top = {d.left, d.top, d.right, d.top + t}, low = {d.left, d.bottom - t, d.right, d.bottom};
+                FillRect(dc, &top, b);
+                FillRect(dc, &low, b);
+                DeleteObject(b);
+            }
+        }
+        RestoreDC(dc, saved);
+    }
+}
+
+// Edit layout: each section gets a veil with its name and Up, Down, Move and Hide or Show.
+static void drawLayoutEditing(HDC dc) {
+    if (!layoutEditing) return;
+    static const wchar_t* NAMES[LAY_COUNT] = {L"Up", L"Down", L"Move \x21C4", L"Hide"};
+    for (int s = 0; s < SEC_COUNT; ++s) {
+        if (!layoutShown[s]) continue;
+        const RECT r = layoutShownRect(s);
+        {
+            PixelSnap px(dc);
+            blendRect(dc, px.map(r), C_BACK, layoutHidden[s] ? 235 : 205);  // dark enough to read the names
+            edgeLines(dc, px.map(r), px.line(), layoutHidden[s] ? C_EDGE : C_GOLD);
+        }
+        label(dc, r.left + 14, r.top + 12, SECTIONS[s].name, layoutHidden[s] ? C_DIM : C_GOLD, fntBold);
+        if (layoutHidden[s]) label(dc, r.left + 14, r.top + 32, L"Hidden", C_DIM, fntUI);
+        for (int b = 0; b < LAY_COUNT; ++b) {
+            const RECT br = layoutButton(s, b);
+            const bool hot = layoutHot == s * LAY_COUNT + b;
+            const wchar_t* text = b == LAY_HIDE && layoutHidden[s] ? L"Show" : NAMES[b];
+            iconButton(dc, br, ICO_NONE, text, hot, true, b == LAY_HIDE && layoutHidden[s]);
+        }
+    }
+}
 static const RECT R_REC_FROM_VOICE = {CX + 24, REC_Y + 6, CX + 50, REC_Y + 30};
 static const RECT R_REC_FROM_HEAR = {CX + 52, REC_Y + 6, CX + 78, REC_Y + 30};
 static const RECT R_REC_GO = {CX + 84, REC_Y + 6, CX + 158, REC_Y + 30};
@@ -10557,7 +10888,6 @@ static std::wstring timeTitle(const wchar_t* what) {
 
 static void takeRefresh(HWND h) { invalidateDesign(h, R_REC_PANEL); }
 
-static const RECT R_STATUS_LINE = {0, WIN_H - STATUS_H, WIN_W, WIN_H};
 
 static bool takeNoteShown() { return !take.note.empty() && (recording() || GetTickCount64() - take.noteAt < 6000); }
 
@@ -11534,7 +11864,9 @@ static void drawTitleBar(HDC dc, const RECT& rc, bool mainView) {
     DeleteObject(gp);
     drawLogo(dc, 10, 0);
     label(dc, 10 + (logoW ? logoW + 8 : 0), 7, L"Pixl", C_GOLD, fntTitle);
-    if (updState.load() == 1 || updState.load() == 2) {
+    if (mainView && layoutEditing) {
+        iconButton(dc, R_LAYOUT_RESET, ICO_RESET, L"Reset", isHot(R_LAYOUT_RESET), !layoutIsDefault());
+    } else if (updState.load() == 1 || updState.load() == 2) {
         const std::wstring t = updState.load() == 2 ? L"Downloading update..." : L"Update to " + updLatest.version.text();
         primaryButton(dc, R_UPDATE, ICO_REFRESH, t.c_str(), isHot(R_UPDATE), updState.load() == 1);
     } else {
@@ -11542,6 +11874,7 @@ static void drawTitleBar(HDC dc, const RECT& rc, bool mainView) {
     }
     if (mainView) {
         const bool just = GetTickCount64() - savedAt < 1500;
+        iconButton(dc, R_LAYOUT, ICO_WINDOW, nullptr, isHot(R_LAYOUT), true, layoutEditing);
         iconButton(dc, R_BOARD, ICO_PLAY, L"Soundboard", isHot(R_BOARD), true, hBoard != nullptr);
         iconButton(dc, R_MIXER, ICO_BARS, L"Mixer", isHot(R_MIXER), true, hMixer != nullptr);
         iconButton(dc, R_TONE, ICO_PAD, L"Tone", isHot(R_TONE), true, hTone != nullptr || toneShaping());
@@ -11742,25 +12075,14 @@ static void paint(HWND hwnd) {
     if (cablePanel) {
         drawCablePanel(dc, rc);
     } else {
-        if (RectVisible(dc, &DEV_BOX)) drawDevices(dc);
-        if (RectVisible(dc, &ROOM_BOX)) drawRoom(dc);
-        drawEqPanel(dc);
-        if (RectVisible(dc, &R_REC_PANEL)) drawRecorder(dc);
+        drawSections(dc);  // each section at its place in the layout
         drawLevelStrip(dc, stripRect());
     }
 
     const RECT statusBox = {0, rc.bottom - STATUS_H, rc.right, rc.bottom};
     if (RectVisible(dc, &statusBox)) drawStatusBar(dc, rc);
 
-    if (mainView) {
-        {
-            PixelSnap px(dc);
-            RECT presetBox = px.map(RECT{PRESET_X, PRESET_Y, PRESET_X + PRESET_LW, PRESET_Y + PRESET_H});
-            InflateRect(&presetBox, px.line(), px.line());
-            edgeLines(dc, presetBox, px.line(), C_EDGE);
-        }
-        drawPresetScrollbar(dc);
-    }
+    if (mainView) drawLayoutEditing(dc);
 
     flatDc(dc);
     SelectClipRgn(dc, nullptr);
@@ -12072,16 +12394,17 @@ static void eqGlidePreset(HWND h, int i) {
 }
 
 static void applyLayout() {
-    const int on = cablePanel ? SW_HIDE : SW_SHOW;
-    ShowWindow(hMic, on);
-    ShowWindow(hSpk, on);
-    ShowWindow(hPreset, on);
-    ShowWindow(hClipUrl, on);
-    ShowWindow(hApp, on);
-    ShowWindow(hEqBox, on);
-    ShowWindow(hMaskBox, on);
-    ShowWindow(hOwnBox, on);
-    ShowWindow(hGlitchBox, on);
+    // A child shows when the main view is up and its section is shown (and not while editing the layout).
+    auto show = [](HWND c, int x, int y) { ShowWindow(c, !cablePanel && layoutChildShown(x, y) ? SW_SHOW : SW_HIDE); };
+    show(hMic, 110, TITLE_H + 18);
+    show(hSpk, 110, TITLE_H + 48);
+    show(hPreset, PRESET_X, PRESET_Y);
+    show(hClipUrl, R_CLIP_URL.left, R_CLIP_URL.top);
+    show(hApp, R_APP_BOX.left, R_APP_BOX.top);
+    show(hEqBox, R_EQ_BOX.left, R_EQ_BOX.top);
+    show(hMaskBox, R_MASK_BOX.left, R_MASK_BOX.top);
+    show(hOwnBox, R_OWN_BOX.left, R_OWN_BOX.top);
+    show(hGlitchBox, R_GLITCH_BOX.left, R_GLITCH_BOX.top);
 }
 
 static const RECT R_OPT_FX   = {332, 340, 540, 355};
@@ -12101,6 +12424,7 @@ static const Hint HINTS[] = {
     {&R_TONE, HINT_MAIN, L"Tone of your voice on a square from deep to sharp, and the Vocal settings: strength, Lo, Mid, Hi and Out."},
     {&R_BOARD, HINT_MAIN, L"Soundboard: twelve pads with sounds, and keys that play them from any program."},
     {&R_MIXER, HINT_MAIN, L"Mixer: put programs on strips, set their volume, send them to the mic, add an echo, Solo and Mute."},
+    {&R_LAYOUT, HINT_MAIN, L"Edit layout: hide, move and reorder the sections of this window. Press again when done."},
     {&R_SETUP_PREV, HINT_MAIN, L"Previous saved setup."},
     {&R_SETUP_NEXT, HINT_MAIN, L"Next saved setup."},
     {&R_SETUP_NAME, HINT_MAIN, L"The setup in use. A setup keeps every setting on this window."},
@@ -12225,6 +12549,12 @@ static void tipsColour() {
     SendMessageW(hTip, TTM_SETTIPTEXTCOLOR, mixc(C_EDGE, C_GOLD, 0.45), 0);
 }
 
+// A hint's area on screen: where its section is now, or nothing when the section is hidden.
+static RECT tipRect(const RECT& home) {
+    RECT r = home;
+    if (!layoutOut(r)) return RECT{0, 0, 0, 0};
+    return scRect(r);
+}
 static void tipsPlace() {
     if (!hTip) return;
     SendMessageW(hTip, WM_SETFONT, (WPARAM)fntCtl, TRUE);
@@ -12236,7 +12566,7 @@ static void tipsPlace() {
         ti.cbSize = TTTOOLINFOW_V2_SIZE;
         ti.hwnd = hwndMain;
         ti.uId = (UINT_PTR)(HINT_ID_BASE + i);
-        ti.rect = scRect(*HINTS[i].r);
+        ti.rect = tipRect(*HINTS[i].r);
         SendMessageW(hTip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
     }
 }
@@ -12256,7 +12586,7 @@ static void tipsCreate(HWND owner) {
         ti.uFlags = TTF_SUBCLASS;
         ti.hwnd = owner;
         ti.uId = (UINT_PTR)(HINT_ID_BASE + i);
-        ti.rect = scRect(*HINTS[i].r);
+        ti.rect = tipRect(*HINTS[i].r);
         ti.lpszText = LPSTR_TEXTCALLBACKW;
         SendMessageW(hTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
     }
@@ -12328,7 +12658,13 @@ static void makeFonts() {
 }
 
 static void placeChild(HWND c, int x, int y, int w, int h) {
-    if (c) SetWindowPos(c, nullptr, sc(x), sc(y), sc(x + w) - sc(x), sc(y + h) - sc(y), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS);
+    if (!c) return;
+    if (GetParent(c) == hwndMain) {
+        // Children of the main window move with their section.
+        RECT r = {x, y, x + w, y + h};
+        if (layoutOut(r)) { x = r.left; y = r.top; }
+    }
+    SetWindowPos(c, nullptr, sc(x), sc(y), sc(x + w) - sc(x), sc(y + h) - sc(y), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS);
 }
 
 static void placeBox(HWND c, const RECT& r, int drop) {
@@ -12703,7 +13039,9 @@ static std::vector<const RECT*> hoverables() {
         if (view != VIEW_READY || g.cableStage.load() == STAGE_PROBLEM) v.push_back(&R_CB_BACK);
         if (view == VIEW_INSTALL) v.insert(v.end(), {&R_CB_FOLDER, &R_CB_SITE});
     } else {
-        if (updState.load() == 1) v.push_back(&R_UPDATE);
+        if (updState.load() == 1 && !layoutEditing) v.push_back(&R_UPDATE);
+        v.push_back(&R_LAYOUT);
+        if (layoutEditing) v.push_back(&R_LAYOUT_RESET);
         v.insert(v.end(), {&R_BOARD, &R_MIXER, &R_TONE, &R_SETUP_PREV, &R_SETUP_NEXT, &R_SAVE, &R_SETUP_DEL, &R_DEV_REFRESH, &R_ISO_PREV, &R_ISO_NEXT,
                            &R_EQ_SAVE, &R_EQ_DROP, &R_EQ_DEF, &R_CLIP_FILE, &R_CLIP_PLAY, &R_CLIP_STOP,
                            &R_CLIP_BACK, &R_CLIP_FWD, &R_MASK_OFF, &R_GLITCH, &R_GLITCH_KEY, &R_SB_UP, &R_SB_DOWN, &R_SB_TRACK});
@@ -12893,7 +13231,7 @@ static FadeSkip fadeSkip(HWND h) {
     FadeSkip s;
     if (h == hwndMain && !cablePanel) {
         s.r[0] = scRect(stripRect());
-        s.r[1] = scRect(R_SB_ALL);
+        s.r[1] = tipRect(R_SB_ALL);
     } else if (h == hBoard && boardScrolls()) {
         s.r[0] = scRect(boardTrack());
         if (boardGliding) s.r[1] = scRect(RB_LIST);
@@ -14010,7 +14348,17 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return 0;
             }
         }
-        if (updState.load() == 1 && PtInRect(&R_UPDATE, p)) {
+        if (PtInRect(&R_LAYOUT, p)) {
+            hotLeave(h);
+            layoutSetEditing(!layoutEditing);
+            return 0;
+        }
+        if (layoutEditing && PtInRect(&R_LAYOUT_RESET, p)) {
+            hotLeave(h);
+            layoutReset();
+            return 0;
+        }
+        if (updState.load() == 1 && !layoutEditing && PtInRect(&R_UPDATE, p)) {
             hotLeave(h);
             updStart(h);
             return 0;
@@ -14594,7 +14942,7 @@ static bool glitchCapture(const MSG& m) {
     case WM_RBUTTONDOWN:
     case WM_NCLBUTTONDOWN:
     case WM_NCRBUTTONDOWN: {
-        const LPARAM at = designPt(m.lParam);
+        const LPARAM at = m.hwnd == hwndMain ? mainDesignPt(hwndMain, m.lParam) : designPt(m.lParam);
         const POINT p = {(short)LOWORD(at), (short)HIWORD(at)};
         if ((m.message == WM_LBUTTONDOWN || m.message == WM_LBUTTONDBLCLK) && m.hwnd == hwndMain && PtInRect(&R_GLITCH_KEY, p)) return false;
         glitchListening = false;
@@ -14738,7 +15086,30 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         if (install) return elevatedInstall(setup);
     }
     HANDLE single = nullptr;
+#ifdef PIXL_PREVIEW
+    // Developer preview build: shows the window beside a running Pixl, on a copy of its settings,
+    // with no sound, mixer or updates. PIXL_LAYOUT and PIXL_EDIT (environment) set the layout to show.
+    {
+        HKEY copy = nullptr, home = nullptr, real = nullptr;
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\PixlPreview");
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\PixlPreview", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &copy, nullptr) == ERROR_SUCCESS &&
+            RegCreateKeyExW(copy, L"Software\\Pixl", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &home, nullptr) == ERROR_SUCCESS) {
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Pixl", 0, KEY_READ, &real) == ERROR_SUCCESS) {
+                RegCopyTreeW(real, nullptr, home);
+                RegCloseKey(real);
+            }
+            wchar_t lay[64];
+            if (GetEnvironmentVariableW(L"PIXL_LAYOUT", lay, 64)) RegSetKeyValueW(home, L"Settings", L"Layout", REG_SZ, lay, (DWORD)((wcslen(lay) + 1) * sizeof(wchar_t)));
+            if (GetEnvironmentVariableW(L"PIXL_NOWALL", nullptr, 0) > 0) RegSetKeyValueW(home, L"Settings", L"Wallpaper", REG_SZ, L"", sizeof(wchar_t));
+            RegCloseKey(home);
+            RegOverridePredefKey(HKEY_CURRENT_USER, copy);
+        }
+        layoutEditing = GetEnvironmentVariableW(L"PIXL_EDIT", nullptr, 0) > 0;
+    }
+    for (int wait = 0; false; ++wait) {
+#else
     for (int wait = 0;; ++wait) {
+#endif
         single = CreateMutexW(nullptr, FALSE, L"Local\\Pixl.Running");
         const DWORD err = GetLastError();
         const bool taken = single ? err == ERROR_ALREADY_EXISTS : err == ERROR_ACCESS_DENIED;
@@ -14778,6 +15149,8 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     eqUserLoad();
     eqLoad();
     settingsLoad();
+    layoutLoad();  // before the window size is worked out
+    layoutCompute();
     {
         const HMONITOR primary = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
         uiDpi = dpiOfMonitor(primary);
@@ -14790,7 +15163,9 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     startupOn = startupIsOn();
     rememberCopyFolder(runFolder());
     rememberCopyFolder(exeFolder());
+#ifndef PIXL_PREVIEW
     if (startupOn) startupFollow();
+#endif
 
     WNDCLASSW wc{};
     wc.style = CS_DBLCLKS;
@@ -14823,7 +15198,9 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     RegisterClassW(&wc);
     gMix.cableFinder = [] { return findCableRender(DEVICE_STATE_ACTIVE).id; };
     gMix.load(MIX_KEY);
+#ifndef PIXL_PREVIEW
     gMix.start(FS);
+#endif
 
     const RECT wa = workAreaOf(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
     int sx = wa.left + (wa.right - wa.left - sc(WIN_W)) / 2;
@@ -14834,7 +15211,9 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
                                 WS_POPUP | WS_CLIPCHILDREN, sx, sy, sc(WIN_W), sc(WIN_H),
                                 nullptr, nullptr, hi, nullptr);
     hwndMain = hwnd;
+#ifndef PIXL_PREVIEW
     updWatch(hwnd);
+#endif
     oldStartupTasks(hwnd, false);
     applyWindowAlpha(hwnd);
     SetWindowPos(hwnd, nullptr, sx, sy, sc(WIN_W), sc(WIN_H), SWP_NOZORDER);
@@ -14924,7 +15303,9 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     }
     presetTopPlace();
 
+#ifndef PIXL_PREVIEW
     std::thread cableThread(provisionCable);
+#endif
 
     boardLoad();
     hotkeysRegister();
@@ -14936,7 +15317,9 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     SetTimer(hwnd, 1, 400, nullptr);
     SetTimer(hwnd, 2, 16, nullptr);
 
+#ifndef PIXL_PREVIEW
     std::thread th(audioThread);
+#endif
     windowOpen(hwnd, nShow);
 
     MSG msg;
@@ -14950,8 +15333,10 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     gApp.stop();
     gClip.stop();
     gHearTap.stop();
+#ifndef PIXL_PREVIEW
     th.join();
     cableThread.join();
+#endif
     clearWallpaper();
     if (logoBmp) { DeleteObject(logoBmp); logoBmp = nullptr; }
     delete logoSrc; logoSrc = nullptr;
