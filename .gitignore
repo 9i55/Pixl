@@ -1,0 +1,6 @@
+.vs/
+build/
+backup/
+deep_backup/
+final_build_msvc/
+*.user

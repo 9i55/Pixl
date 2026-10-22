@@ -1,0 +1,31 @@
+1 24 "app.manifest"
+1 ICON "../res/pixl.ico"
+201 RCDATA "../res/pixl.png"
+202 RCDATA "../res/dsaffe.png"
+
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEOS          0x40004L
+FILETYPE        0x1L
+{
+  BLOCK "StringFileInfo"
+  {
+    BLOCK "040904b0"
+    {
+      VALUE "CompanyName",      "Pixl"
+      VALUE "FileDescription",  "Pixl Audio Effects Console"
+      VALUE "FileVersion",      "1.0.0.0"
+      VALUE "InternalName",     "Pixl"
+      VALUE "LegalCopyright",   "Pixl - based on OctopusEAX (c) 2026 Freemasonry, MIT License"
+      VALUE "LegalTrademarks",  "Pixl"
+      VALUE "OriginalFilename", "Pixl.exe"
+      VALUE "ProductName",      "Pixl"
+      VALUE "ProductVersion",   "1.0.0.0"
+    }
+  }
+  BLOCK "VarFileInfo"
+  {
+    VALUE "Translation", 0x409, 1200
+  }
+}
