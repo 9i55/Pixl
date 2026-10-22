@@ -1,11 +1,12 @@
+#include "version.hpp"
 1 24 "app.manifest"
 1 ICON "../res/pixl.ico"
 201 RCDATA "../res/pixl.png"
-202 RCDATA "../res/dsaffe.png"
+202 RCDATA "../res/pixl-art.png"
 
 1 VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     PIXL_VERSION_RC
+PRODUCTVERSION  PIXL_VERSION_RC
 FILEOS          0x40004L
 FILETYPE        0x1L
 {
@@ -15,13 +16,13 @@ FILETYPE        0x1L
     {
       VALUE "CompanyName",      "Pixl"
       VALUE "FileDescription",  "Pixl Audio Effects Console"
-      VALUE "FileVersion",      "1.0.0.0"
+      VALUE "FileVersion",      PIXL_VERSION_STR
       VALUE "InternalName",     "Pixl"
-      VALUE "LegalCopyright",   "Pixl - based on OctopusEAX (c) 2026 Freemasonry, MIT License"
+      VALUE "LegalCopyright",   "Copyright (c) 2026 9i55"
       VALUE "LegalTrademarks",  "Pixl"
       VALUE "OriginalFilename", "Pixl.exe"
       VALUE "ProductName",      "Pixl"
-      VALUE "ProductVersion",   "1.0.0.0"
+      VALUE "ProductVersion",   PIXL_VERSION_STR
     }
   }
   BLOCK "VarFileInfo"

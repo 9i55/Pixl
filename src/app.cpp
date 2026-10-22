@@ -73,6 +73,7 @@ using std::max; using std::min;
 #include "playback/player.hpp"
 #include "playback/program_tap.hpp"
 #include "mixing/app_mixer.hpp"
+#include "update/updater.hpp"
 #include "playback/recorder.hpp"
 #include "playback/sound_board.hpp"
 #include "playback/sound_edit.hpp"
@@ -2182,19 +2183,16 @@ static void buildArt() {
     void* bits = nullptr;
     HBITMAP hb = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!hb || !bits) { conv.UnlockBits(&bd); if (hb) DeleteObject(hb); return; }
-    const double hue = look.theme.hue, satK = look.theme.sat / 100.0;
+    // The Pixl logo keeps its own white and orange instead of taking the theme's colour.
     for (int y = 0; y < th; ++y) {
         const unsigned char* s = (const unsigned char*)bd.Scan0 + (size_t)y * bd.Stride;
         unsigned char* d = (unsigned char*)bits + (size_t)y * tw * 4;
         for (int x = 0; x < tw; ++x, s += 4, d += 4) {
             const int a = s[3];
             if (a == 0) { d[0] = d[1] = d[2] = d[3] = 0; continue; }
-            double h, sat, l;
-            rgbHsl(RGB(s[2], s[1], s[0]), h, sat, l);
-            const COLORREF c = hslRgb(hue, sat * satK, l);
-            d[0] = (unsigned char)(GetBValue(c) * a / 255);
-            d[1] = (unsigned char)(GetGValue(c) * a / 255);
-            d[2] = (unsigned char)(GetRValue(c) * a / 255);
+            d[0] = (unsigned char)(s[0] * a / 255);
+            d[1] = (unsigned char)(s[1] * a / 255);
+            d[2] = (unsigned char)(s[2] * a / 255);
             d[3] = (unsigned char)a;
         }
     }
@@ -6001,6 +5999,13 @@ static std::wstring curSetup;
 static const RECT R_SETUP_PREV = {WIN_W - 404, 5, WIN_W - 378, 29};
 static const RECT R_BOARD = {WIN_W - 530, 5, WIN_W - 414, 29};
 static const RECT R_MIXER = {WIN_W - 782, 5, WIN_W - 666, 29};
+
+// Updates: the button takes the subtitle's place in the title bar while one is waiting.
+static const RECT R_UPDATE = {96, 5, 296, 29};
+static std::atomic<int> updState{0};  // 0 nothing, 1 waiting to install, 2 downloading, 3 restarting
+static update::Latest updLatest;       // written by the checker before it posts WM_UPD_FOUND
+static std::wstring updRelaunch;
+static const UINT WM_UPD_FOUND = WM_APP + 61, WM_UPD_DONE = WM_APP + 62;
 static const RECT R_TONE  = {WIN_W - 656, 5, WIN_W - 540, 29};
 static const RECT R_SETUP_NAME = {WIN_W - 374, 5, WIN_W - 256, 29};
 static const RECT R_SETUP_NEXT = {WIN_W - 252, 5, WIN_W - 226, 29};
@@ -7528,7 +7533,7 @@ static void openToneBox(HWND owner) {
 static int aboutResult = 0, aboutHot = 0;
 static bool aboutMouse = false;
 static RECT aboutLink = {0, 0, 0, 0};
-static const wchar_t* ABOLHB_SITE = L"https://abolhb.com";
+static const wchar_t* PIXL_SITE = L"https://github.com/" PIXL_REPO;
 static const int AB_W = 460, AB_H = 304;
 static const RECT R_AB_CLOSE = {AB_W - 34, 5, AB_W - 8, 29};
 static RECT aboutOk(const RECT& rc) { return {24, rc.bottom - 50, 100, rc.bottom - 24}; }
@@ -7541,9 +7546,9 @@ static void paintAbout(HDC dc, const RECT& rc) {
         drawGlow(dc, ax + aw / 2.0f, ay + ah / 2.0f, aw * 0.9f, ah * 0.62f, C_GOLD, 56);
         drawBitmapAlpha(dc, artBmp, ax, ay, aw, ah);
     }
-    label(dc, 24, 58, L"Based on OctopusEAX by :", C_GOLD, fntBold);
+    label(dc, 24, 58, L"Programmed by :", C_GOLD, fntBold);
     {
-        const wchar_t* name = L"ABOLHB";
+        const wchar_t* name = L"9i55";
         const COLORREF ink = aboutHot == 2 ? C_GOLD : C_TEXT;
         label(dc, 24, 82, name, ink, fntBold);
         SIZE sz{};
@@ -7560,10 +7565,11 @@ static void paintAbout(HDC dc, const RECT& rc) {
             DeleteObject(pen);
         }
     }
-    label(dc, 24, 102, L"MMLo7", C_TEXT, fntBold);
-    label(dc, 24, 138, L"Special thanks to :", C_GOLD, fntBold);
-    label(dc, 24, 162, L"FREEMASONRY", C_TEXT, fntBold);
-    label(dc, 24, 182, L"SALEMLY", C_TEXT, fntBold);
+    label(dc, 24, 126, L"Special thanks to :", C_GOLD, fntBold);
+    label(dc, 24, 150, L"sexuility", C_TEXT, fntBold);
+    label(dc, 24, 170, L"sothls", C_TEXT, fntBold);
+    label(dc, 24, 204, L"Version " PIXL_VERSION_STR, C_DIM, fntUI);
+    label(dc, 24, 222, L"Based on OctopusEAX (MIT License)", C_DIM, fntUI);
     primaryButton(dc, aboutOk(rc), ICO_NONE, L"OK", aboutHot == 1);
     boxEdge(dc);
 }
@@ -7614,7 +7620,7 @@ static LRESULT CALLBACK aboutProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         GetClientRect(h, &dev);
         const RECT done = aboutOk(designRect(dev.right, dev.bottom));
         if (PtInRect(&done, p) || PtInRect(&R_AB_CLOSE, p)) aboutResult = 1;
-        else if (PtInRect(&aboutLink, p)) ShellExecuteW(nullptr, L"open", ABOLHB_SITE, nullptr, nullptr, SW_SHOWNORMAL);
+        else if (PtInRect(&aboutLink, p)) ShellExecuteW(nullptr, L"open", PIXL_SITE, nullptr, nullptr, SW_SHOWNORMAL);
         else if (p.y < TITLE_H) { ReleaseCapture(); SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0); }
         return 0;
     }
@@ -11370,7 +11376,12 @@ static void drawTitleBar(HDC dc, const RECT& rc, bool mainView) {
     DeleteObject(gp);
     drawLogo(dc, 10, 0);
     label(dc, 10 + (logoW ? logoW + 8 : 0), 7, L"Pixl", C_GOLD, fntTitle);
-    label(dc, 10 + (logoW ? logoW + 8 : 0) + titleW, 12, L"Audio Effects Console", C_DIM, fntUI);
+    if (updState.load() == 1 || updState.load() == 2) {
+        const std::wstring t = updState.load() == 2 ? L"Downloading update..." : L"Update to " + updLatest.version.text();
+        primaryButton(dc, R_UPDATE, ICO_REFRESH, t.c_str(), isHot(R_UPDATE), updState.load() == 1);
+    } else {
+        label(dc, 10 + (logoW ? logoW + 8 : 0) + titleW, 12, L"Audio Effects Console", C_DIM, fntUI);
+    }
     if (mainView) {
         const bool just = GetTickCount64() - savedAt < 1500;
         iconButton(dc, R_BOARD, ICO_PLAY, L"Soundboard", isHot(R_BOARD), true, hBoard != nullptr);
@@ -12534,6 +12545,7 @@ static std::vector<const RECT*> hoverables() {
         if (view != VIEW_READY || g.cableStage.load() == STAGE_PROBLEM) v.push_back(&R_CB_BACK);
         if (view == VIEW_INSTALL) v.insert(v.end(), {&R_CB_FOLDER, &R_CB_SITE});
     } else {
+        if (updState.load() == 1) v.push_back(&R_UPDATE);
         v.insert(v.end(), {&R_BOARD, &R_MIXER, &R_TONE, &R_SETUP_PREV, &R_SETUP_NEXT, &R_SAVE, &R_SETUP_DEL, &R_DEV_REFRESH, &R_ISO_PREV, &R_ISO_NEXT,
                            &R_EQ_SAVE, &R_EQ_DROP, &R_EQ_DEF, &R_CLIP_FILE, &R_CLIP_PLAY, &R_CLIP_STOP,
                            &R_CLIP_BACK, &R_CLIP_FWD, &R_MASK_OFF, &R_GLITCH, &R_GLITCH_KEY, &R_SB_UP, &R_SB_DOWN, &R_SB_TRACK});
@@ -13247,6 +13259,83 @@ static void ghostClear() {
     dropStop();
 }
 
+// Looks for a newer release a few seconds after start, then every six hours.
+static void updWatch(HWND owner) {
+    std::thread([owner] {
+        Sleep(5000);
+        for (;;) {
+            update::Latest l;
+            if (updState.load() == 0 && update::latest(l) && l.version.newerThan(update::current())) {
+                updLatest = l;
+                updState = 1;
+                PostMessageW(owner, WM_UPD_FOUND, 0, 0);
+                return;
+            }
+            Sleep(6 * 60 * 60 * 1000);
+        }
+    }).detach();
+}
+
+static std::wstring updDownloadPath() { return exeFolder() + L"\\Pixl.update.exe"; }
+static std::wstring updOldPath() { return exeFolder() + L"\\Pixl.old.exe"; }
+static std::wstring updWhy;
+
+static void updStart(HWND h) {
+    const std::wstring ask = L"Pixl " + updLatest.version.text() + L" is ready (you have " + update::current().text() +
+                             L").\n\nDownload it and restart Pixl now? Your settings stay as they are.";
+    if (MessageBoxW(h, ask.c_str(), L"Update Pixl", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    updState = 2;
+    InvalidateRect(h, nullptr, FALSE);
+    const update::Latest l = updLatest;
+    std::thread([h, l] {
+        std::wstring why;
+        const bool ok = update::download(l, updDownloadPath(), why);
+        if (!ok) updWhy = why;
+        PostMessageW(h, WM_UPD_DONE, ok ? 1 : 0, 0);
+    }).detach();
+}
+
+// The new exe is next to the running one: swap them, then close so WinMain starts the new one.
+static void updFinish(HWND h, bool downloaded) {
+    auto fail = [&](const std::wstring& why) {
+        updState = 1;
+        InvalidateRect(h, nullptr, FALSE);
+        const std::wstring text = why + L"\n\nYou can also download it from github.com/" PIXL_REPO L"/releases";
+        MessageBoxW(h, text.c_str(), L"Update Pixl", MB_OK | MB_ICONWARNING);
+    };
+    if (!downloaded) { fail(updWhy); return; }
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const std::wstring cur = exe, old = updOldPath(), fresh = updDownloadPath();
+    DeleteFileW(old.c_str());
+    // A running exe can be renamed but not overwritten.
+    if (!MoveFileExW(cur.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(fresh.c_str());
+        fail(L"Pixl couldn't replace itself in its folder. Move Pixl to a folder you own (like Documents) and try again.");
+        return;
+    }
+    if (!MoveFileExW(fresh.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING);
+        fail(L"Pixl couldn't put the new version in place.");
+        return;
+    }
+    updRelaunch = cur;
+    updState = 3;
+    DestroyWindow(h);
+}
+
+// After an update: the old exe and any half download are left over; remove them once the old Pixl is gone.
+static void updTidy() {
+    std::thread([] {
+        for (int i = 0; i < 30; ++i) {
+            const bool gone = DeleteFileW(updOldPath().c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
+            DeleteFileW(updDownloadPath().c_str());
+            if (gone) return;
+            Sleep(1000);
+        }
+    }).detach();
+}
+
 static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_PAINT:
@@ -13323,6 +13412,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_TAKE_SAVED:
         takeSaved(h, l);
+        return 0;
+    case WM_UPD_FOUND:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_UPD_DONE:
+        updFinish(h, w != 0);
         return 0;
     case WM_ZOOM_SETTLE:
         zoomSettle(h);
@@ -13630,6 +13725,11 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 setIsoFromX(h, p.x);
                 return 0;
             }
+        }
+        if (updState.load() == 1 && PtInRect(&R_UPDATE, p)) {
+            hotLeave(h);
+            updStart(h);
+            return 0;
         }
         if (PtInRect(&R_MIXER, p)) {
             hotLeave(h);
@@ -14334,11 +14434,13 @@ static void carryOldSettings() {
 }
 
 int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int nShow) {
+    bool updated = false;  // started by the old version right after it swapped itself out
     {
         int argc = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         const bool install = argv && argc > 2 && wcscmp(argv[1], INSTALL_FLAG) == 0;
         const std::wstring setup = install ? std::wstring(argv[2]) : std::wstring();
+        updated = argv && argc > 1 && wcscmp(argv[1], L"--updated") == 0;
         if (argv) LocalFree(argv);
         if (install) return elevatedInstall(setup);
     }
@@ -14348,7 +14450,7 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         const DWORD err = GetLastError();
         const bool taken = single ? err == ERROR_ALREADY_EXISTS : err == ERROR_ACCESS_DENIED;
         const HWND other = FindWindowW(L"PixlWnd", nullptr);
-        if (other) {
+        if (other && !updated) {
             if (IsIconic(other)) ShowWindow(other, SW_RESTORE);
             ShowWindow(other, SW_SHOW);
             SetForegroundWindow(other);
@@ -14356,9 +14458,11 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         if (!taken && !other) break;
         if (single) CloseHandle(single);
         single = nullptr;
-        if (other || wait >= 30) return 0;
+        // After an update, wait for the old version to finish closing.
+        if ((other && !updated) || wait >= (updated ? 300 : 30)) return 0;
         Sleep(100);
     }
+    updTidy();
     if (const HWND octopus = FindWindowW(L"OctopusEAXWnd", nullptr)) {
         // Both would hold the mic and the cable at once.
         MessageBoxW(nullptr, L"OctopusEAX is still open. Close it first, then open Pixl again.", L"Pixl", MB_OK | MB_ICONINFORMATION);
@@ -14437,6 +14541,7 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
                                 WS_POPUP | WS_CLIPCHILDREN, sx, sy, sc(WIN_W), sc(WIN_H),
                                 nullptr, nullptr, hi, nullptr);
     hwndMain = hwnd;
+    updWatch(hwnd);
     oldStartupTasks(hwnd, false);
     applyWindowAlpha(hwnd);
     SetWindowPos(hwnd, nullptr, sx, sy, sc(WIN_W), sc(WIN_H), SWP_NOZORDER);
@@ -14567,6 +14672,17 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     const bool clipDone = gClip.settle(3000);
     const bool mediaDone = mediaSettle(20000);
     if (single) CloseHandle(single);
+    if (!updRelaunch.empty()) {
+        // Start the version that was just installed; it waits for this one to be gone.
+        STARTUPINFOW si{};
+        si.cb = sizeof si;
+        PROCESS_INFORMATION pi{};
+        std::wstring cmd = L"\"" + updRelaunch + L"\" --updated";
+        if (CreateProcessW(updRelaunch.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, exeFolder().c_str(), &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
     if (!clipDone || !mediaDone) ExitProcess(0);
     if (media) MFShutdown();
     if (SUCCEEDED(com)) CoUninitialize();

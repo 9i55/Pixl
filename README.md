@@ -67,6 +67,12 @@
 - مايك.
 - [VB-CABLE](https://vb-audio.com/Cable/)، والبرنامج يثبّته لك.
 
+### التحديثات
+
+من إصدار 1.1 وطالع، Pixl يتأكد بنفسه إذا فيه إصدار جديد. إذا لقى، يطلع زر **Update to …** فوق في البرنامج. اضغطه، ووافق، والبرنامج يحمّل النسخة الجديدة ويتأكد إنها سليمة ويعيد تشغيل نفسه، وإعداداتك تبقى زي ما هي.
+
+إذا عندك إصدار 1.0، حمّل 1.1 مرة وحدة من صفحة التحميل، وبعدها التحديثات تجيك لحالها.
+
 </div>
 
 ---
@@ -125,6 +131,12 @@
 - A microphone.
 - [VB-CABLE](https://vb-audio.com/Cable/). Pixl installs it for you.
 
+### Updates
+
+From version 1.1 on, Pixl checks for a newer release by itself. When there is one, an **Update to …** button shows at the top of Pixl. Click it and confirm: Pixl downloads the new version, checks it against its SHA-256, and restarts. Your settings stay as they are.
+
+If you have version 1.0, download 1.1 once from the releases page; updates come by themselves after that.
+
 ### Build from source
 
 You need Visual Studio 2022 (or newer) with the **Desktop development with C++** workload.
@@ -139,4 +151,14 @@ The program is written to `build\MasonEAX\Pixl.exe`.
 
 ## Credits
 
-Pixl is based on [OctopusEAX](https://github.com/ALMASONYH/OctopusEAX) by ABOLHB / ALMASONYH, released under the MIT License. Pixl adds the program mixer, the soundboard drag and drop, and a new look, and keeps the same license. See [LICENSE](LICENSE).
+Pixl is based on [OctopusEAX](https://github.com/ALMASONYH/OctopusEAX) by ABOLHB / ALMASONYH, released under the MIT License. Pixl adds the program mixer, the soundboard drag and drop, and a new look, and keeps the same license. See [LICENSE](LICENSE) and [NOTICE-OctopusEAX.txt](NOTICE-OctopusEAX.txt).
+
+### Publishing an update (maintainer)
+
+With Visual Studio 2022, git and the GitHub CLI signed in to the repo's account:
+
+```powershell
+.\tools\release.ps1 -Version 1.2.0 -Notes "What changed"
+```
+
+The script sets the version, builds, uploads `Pixl.zip`, `Pixl.exe` and `Pixl.exe.sha256`, and creates the release. Everyone on 1.1 or newer gets the update button.

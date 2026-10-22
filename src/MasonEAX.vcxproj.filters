@@ -221,13 +221,13 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\res\octopus.ico">
+    <Image Include="..\res\pixl.ico">
       <Filter>Resource Files</Filter>
     </Image>
-    <Image Include="..\res\octopus.png">
+    <Image Include="..\res\pixl.png">
       <Filter>Resource Files</Filter>
     </Image>
-    <Image Include="..\res\dsaffe.png">
+    <Image Include="..\res\pixl-art.png">
       <Filter>Resource Files</Filter>
     </Image>
   </ItemGroup>
