@@ -6,3 +6,4 @@
 #define PIXL_VERSION_STR "1.1.3"
 #define PIXL_VERSION_RC 1,1,3,0
 #define PIXL_REPO "9i55/Pixl"
+#define PIXL_CONTROL_URL L"https://gist.githubusercontent.com/9i55/0fa0710faf87724c47cd767e296b26d2/raw/control.json"

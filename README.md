@@ -161,24 +161,6 @@ The program is written to `build\MasonEAX\Pixl.exe`.
 
 The script sets the version, builds, uploads `Pixl.zip`, `Pixl.exe` and `Pixl.exe.sha256`, and creates the release. Everyone on 1.1 or newer gets the update button.
 
-### Turning Pixl off or requiring an update (maintainer)
-
-Edit [`control.json`](control.json) on GitHub (pencil icon, then **Commit changes**). Pixl 1.1.4 and newer read it when they start and every 30 minutes; GitHub may take up to 5 minutes to serve the change.
-
-```json
-{
-  "disabled": false,
-  "minVersion": "1.0.0",
-  "message": ""
-}
-```
-
-- `"disabled": true` shows `message` (or a default note) and closes Pixl for everyone. Set it back to `false` to turn Pixl on again.
-- `"minVersion": "1.2.0"` makes every copy older than 1.2.0 update before it can be used. Publish that version first.
-- `message` is optional text shown with either. Don't use double quotes inside it.
-
-Without internet, Pixl runs as usual.
-
 ### Download counts (maintainer)
 
 ```powershell

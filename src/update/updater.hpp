@@ -134,7 +134,7 @@ inline std::wstring wide(const std::string& utf8) {
     return out;
 }
 
-// control.json in the repo lets the developer turn Pixl off for everyone, or require a
+// control.json (a secret gist of the repo owner) lets the developer turn Pixl off for everyone, or require a
 // minimum version (older copies must update before they can be used).
 struct Control {
     bool disabled = false;
@@ -144,7 +144,7 @@ struct Control {
 
 inline bool control(Control& out) {
     std::string body;
-    if (!fetch(L"https://raw.githubusercontent.com/" PIXL_REPO L"/main/control.json", &body, L"", 64 * 1024)) return false;
+    if (!fetch(PIXL_CONTROL_URL, &body, L"", 64 * 1024)) return false;
     out.disabled = jsonTrue(body, "disabled");
     out.minVersion = Version::parse(jsonString(body, "minVersion"));
     out.message = wide(jsonString(body, "message"));
