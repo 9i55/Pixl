@@ -88,6 +88,7 @@ using std::max; using std::min;
 #include "voice/glitch_pad.hpp"
 #include "voice/voice_shaper.hpp"
 #include "voice/voice_tone.hpp"
+#include "voice/voice_color.hpp"
 using namespace mix;
 
 static clip::Player gClip;
@@ -297,6 +298,8 @@ struct Shared {
     std::atomic<int>  toneHi{0};
     std::atomic<int>  tonePadX{0};
     std::atomic<int>  tonePadY{0};
+    std::atomic<int>  colorX{0};  // Voice pad (Voicemeeter-style colour panel), -100..100
+    std::atomic<int>  colorY{0};
     std::atomic<int>  toneBaseLo{0};
     std::atomic<int>  toneBaseMid{0};
     std::atomic<int>  toneBaseHi{0};
@@ -1032,6 +1035,8 @@ static void audioThread() {
     presetGate.prepare(FS);
     voice::VoiceTone voiceTone;
     voiceTone.prepare(FS);
+    voice::VoiceColor voiceColor;
+    voiceColor.prepare(FS);
     InputTap inputTap;
     voice::VoiceShaper shaper;
     const auto voicefxBox = std::make_unique<voice::VoiceFx>();
@@ -1327,12 +1332,14 @@ static void audioThread() {
                     if (toneSeen != g.toneVersion.load()) {
                         toneSeen = g.toneVersion.load();
                         voiceTone.set(toneGains());
+                        voiceColor.set(g.colorX.load(), g.colorY.load());
                     }
                     if (micGain > 0.0f && micGain != toneGain) {
                         if (toneGain > 0.0f) voiceTone.shiftLevel(20.0 * log10((double)micGain / toneGain));
                         toneGain = micGain;
                     }
                     voiceTone.process(mono.data(), (int)frames);
+                    voiceColor.process(mono.data(), (int)frames);
 
                     const bool voiceChange = (g.changeOn.load() & ON_VOICE) != 0;
                     voicePace.process(mono.data(), (int)frames, voiceChange ? g.voiceSpeed.load() : 100, g.voiceKeepPitch.load());
@@ -5520,6 +5527,8 @@ static void settingsSave() {
     put(L"ToneHi", g.toneHi.load() + TONE_SAVED_ZERO);
     put(L"TonePadX", g.tonePadX.load() + TONE_PAD_RANGE);
     put(L"TonePadY", g.tonePadY.load() + TONE_PAD_RANGE);
+    put(L"ColorX", g.colorX.load() + TONE_PAD_RANGE);
+    put(L"ColorY", g.colorY.load() + TONE_PAD_RANGE);
     put(L"ToneBaseLo", g.toneBaseLo.load() + TONE_SAVED_ZERO);
     put(L"ToneBaseMid", g.toneBaseMid.load() + TONE_SAVED_ZERO);
     put(L"ToneBaseHi", g.toneBaseHi.load() + TONE_SAVED_ZERO);
@@ -5625,6 +5634,8 @@ static void settingsLoad() {
     g.toneHi = get(L"ToneHi", TONE_SAVED_ZERO - TONE_RANGE, TONE_SAVED_ZERO + TONE_RANGE, TONE_SAVED_ZERO) - TONE_SAVED_ZERO;
     g.tonePadX = get(L"TonePadX", 0, 2 * TONE_PAD_RANGE, TONE_PAD_RANGE) - TONE_PAD_RANGE;
     g.tonePadY = get(L"TonePadY", 0, 2 * TONE_PAD_RANGE, TONE_PAD_RANGE) - TONE_PAD_RANGE;
+    g.colorX = get(L"ColorX", 0, 2 * TONE_PAD_RANGE, TONE_PAD_RANGE) - TONE_PAD_RANGE;
+    g.colorY = get(L"ColorY", 0, 2 * TONE_PAD_RANGE, TONE_PAD_RANGE) - TONE_PAD_RANGE;
     g.toneBaseLo = get(L"ToneBaseLo", TONE_SAVED_ZERO - TONE_RANGE, TONE_SAVED_ZERO + TONE_RANGE, TONE_SAVED_ZERO) - TONE_SAVED_ZERO;
     g.toneBaseMid = get(L"ToneBaseMid", TONE_SAVED_ZERO - TONE_RANGE, TONE_SAVED_ZERO + TONE_RANGE, TONE_SAVED_ZERO) - TONE_SAVED_ZERO;
     g.toneBaseHi = get(L"ToneBaseHi", TONE_SAVED_ZERO - TONE_RANGE, TONE_SAVED_ZERO + TONE_RANGE, TONE_SAVED_ZERO) - TONE_SAVED_ZERO;
@@ -5827,6 +5838,7 @@ static bool settingsFileSave(const std::wstring& path) {
     fprintf(f, "vocal_level=%d\ngate_lo=%d\ngate_mid=%d\ngate_hi=%d\ngate_out=%d\n", g.gateLevel.load(), g.gateLo.load(), g.gateMid.load(), g.gateHi.load(), g.gateOut.load());
     fprintf(f, "tone_on=%d\ntone_lo=%d\ntone_mid=%d\ntone_hi=%d\ntone_pad_x=%d\ntone_pad_y=%d\ntone_base_lo=%d\ntone_base_mid=%d\ntone_base_hi=%d\n", g.toneOn.load() ? 1 : 0,
             g.toneLo.load(), g.toneMid.load(), g.toneHi.load(), g.tonePadX.load(), g.tonePadY.load(), g.toneBaseLo.load(), g.toneBaseMid.load(), g.toneBaseHi.load());
+    fprintf(f, "color_x=%d\ncolor_y=%d\n", g.colorX.load(), g.colorY.load());
     fprintf(f, "clip_level=%d\nclip_hear=%d\nclip_mic=%d\napp_hear=%d\napp_only=%d\n", g.clipGain.load(), g.clipHear.load() ? 1 : 0, g.clipToMic.load() ? 1 : 0, g.appHear.load() ? 1 : 0,
             g.appOnly.load() ? 1 : 0);
     fprintf(f, "pitch_hz=%d\nvoice_size=%d\nvoice_macro=%d\nvoice_ratio=%d\nvoice_mask=%d\napp_gain=%d\n", g.pitchHz.load(), g.voiceSize.load(), g.voiceMacro.load(), g.voiceRatio.load(), g.voiceMask.load(), g.appGain.load());
@@ -5908,6 +5920,8 @@ static void settingsFileLoad(const std::wstring& path) {
         else if (k == "tone_hi")   { g.toneHi = clampi(iv, -TONE_RANGE, TONE_RANGE); g.toneVersion.fetch_add(1); }
         else if (k == "tone_pad_x") g.tonePadX = clampi(iv, -TONE_PAD_RANGE, TONE_PAD_RANGE);
         else if (k == "tone_pad_y") g.tonePadY = clampi(iv, -TONE_PAD_RANGE, TONE_PAD_RANGE);
+        else if (k == "color_x") { g.colorX = clampi(iv, -TONE_PAD_RANGE, TONE_PAD_RANGE); g.toneVersion.fetch_add(1); }
+        else if (k == "color_y") { g.colorY = clampi(iv, -TONE_PAD_RANGE, TONE_PAD_RANGE); g.toneVersion.fetch_add(1); }
         else if (k == "tone_base_lo")  g.toneBaseLo = clampi(iv, -TONE_RANGE, TONE_RANGE);
         else if (k == "tone_base_mid") g.toneBaseMid = clampi(iv, -TONE_RANGE, TONE_RANGE);
         else if (k == "tone_base_hi")  g.toneBaseHi = clampi(iv, -TONE_RANGE, TONE_RANGE);
@@ -7239,12 +7253,15 @@ static void vocalReset(HWND h) {
 }
 static int toneHot = -1, toneDrag = -1;
 static bool toneMouse = false;
-static const int TONE_W = 420, TONE_H = 616, TONE_PAD_INSET = 10;
+static const int TONE_W = 680, TONE_H = 616, TONE_PAD_INSET = 10;
 static const RECT RN_CLOSE = {TONE_W - 34, 5, TONE_W - 8, 29};
 static const RECT RN_PANEL = {12, 46, TONE_W - 12, TONE_H - 12};
 static const RECT RN_ON    = {24, 84, 124, 99};
-static const RECT RN_FLAT  = {TONE_W - 120, 78, TONE_W - 24, 102};
+static const RECT RN_FLAT  = {230, 78, 330, 102};
 static const RECT RN_PAD   = {90, 114, 330, 354};
+// Voice: Voicemeeter's colour panel. Left/right Lo to Hi, up brightness and a tiny echo.
+static const RECT RV_PAD    = {410, 114, 650, 354};
+static const RECT RV_CENTER = {550, 78, 650, 102};
 static const int RN_VOCAL_Y = 370;
 static const RECT RN_THR   = {100, 404, 330, 426};
 static const RECT RN_LO    = {100, 436, 330, 458};
@@ -7254,7 +7271,7 @@ static const RECT RN_OUT   = {100, 532, 330, 554};
 static const RECT RN_RESET = {TONE_W - 196, 566, TONE_W - 24, 592};
 static const RECT* VOCAL_FADERS[5] = {&RN_THR, &RN_LO, &RN_MID, &RN_HI, &RN_OUT};
 static const wchar_t* VOCAL_NAMES[5] = {L"Strength", L"Lo", L"Mid", L"Hi", L"Out"};
-enum { TN_NONE = -1, TN_CLOSE = 100, TN_ON, TN_FLAT, TN_PAD, TN_RESET };
+enum { TN_NONE = -1, TN_CLOSE = 100, TN_ON, TN_FLAT, TN_PAD, TN_RESET, TN_VPAD, TN_VCENTER };
 
 static void setVocalFader(HWND h, int k, int x) {
     int v = vocalKnobMin(k) + faderValue(*VOCAL_FADERS[k], x, vocalKnobMax(k) - vocalKnobMin(k));
@@ -7292,7 +7309,9 @@ static void toneSettle() {
     g.tonePadX = 0;
     g.tonePadY = 0;
 }
-static bool toneShaping() { return g.toneOn.load() && (g.toneLo.load() != 0 || g.toneMid.load() != 0 || g.toneHi.load() != 0); }
+static bool toneShaping() {
+    return (g.toneOn.load() && (g.toneLo.load() != 0 || g.toneMid.load() != 0 || g.toneHi.load() != 0)) || g.colorX.load() != 0 || g.colorY.load() != 0;
+}
 static int toneRoom(int fromBase) { return clampInt(fromBase * TONE_PAD_RANGE / TONE_RANGE, 0, TONE_PAD_RANGE); }
 static void toneChanged(HWND h) {
     g.toneVersion.fetch_add(1);
@@ -7337,6 +7356,8 @@ static int toneHit(POINT p) {
     if (PtInRect(&RN_FLAT, p)) return TN_FLAT;
     if (PtInRect(&RN_PAD, p)) return TN_PAD;
     if (PtInRect(&RN_RESET, p)) return TN_RESET;
+    if (PtInRect(&RV_PAD, p)) return TN_VPAD;
+    if (PtInRect(&RV_CENTER, p)) return TN_VCENTER;
     return vocalFaderAt(p);
 }
 static void paintTonePad(HDC dc, bool live) {
@@ -7375,18 +7396,83 @@ static void paintTonePad(HDC dc, bool live) {
     Gdiplus::Pen edge(gpColor(C_KNOB), 1.2f);
     gr.DrawEllipse(&edge, d.x - 7.0f, d.y - 7.0f, 14.0f, 14.0f);
 }
+static void setVoiceColor(HWND h, int x, int y) {
+    x = clampInt(x, -TONE_PAD_RANGE, TONE_PAD_RANGE);
+    y = clampInt(y, -TONE_PAD_RANGE, TONE_PAD_RANGE);
+    if (x == g.colorX.load() && y == g.colorY.load()) return;
+    g.colorX = x;
+    g.colorY = y;
+    toneChanged(h);
+}
+static POINT voiceColorPoint() {
+    const int w = RV_PAD.right - RV_PAD.left - 2 * TONE_PAD_INSET, hgt = RV_PAD.bottom - RV_PAD.top - 2 * TONE_PAD_INSET;
+    return {RV_PAD.left + TONE_PAD_INSET + (g.colorX.load() + TONE_PAD_RANGE) * w / (2 * TONE_PAD_RANGE),
+            RV_PAD.top + TONE_PAD_INSET + (TONE_PAD_RANGE - g.colorY.load()) * hgt / (2 * TONE_PAD_RANGE)};
+}
+static void setVoiceColorFromPoint(HWND h, POINT p) {
+    const int w = RV_PAD.right - RV_PAD.left - 2 * TONE_PAD_INSET, hgt = RV_PAD.bottom - RV_PAD.top - 2 * TONE_PAD_INSET;
+    const int dx = clampInt(p.x - RV_PAD.left - TONE_PAD_INSET, 0, w), dy = clampInt(p.y - RV_PAD.top - TONE_PAD_INSET, 0, hgt);
+    int x = (dx * 2 * TONE_PAD_RANGE + w / 2) / w - TONE_PAD_RANGE, y = TONE_PAD_RANGE - (dy * 2 * TONE_PAD_RANGE + hgt / 2) / hgt;
+    if (abs(x) <= 4) x = 0;  // the centre lines catch the dot, so neutral is easy to find
+    if (abs(y) <= 4) y = 0;
+    setVoiceColor(h, x, y);
+}
+static void paintVoicePad(HDC dc) {
+    const RECT& r = RV_PAD;
+    const bool held = toneDrag == TN_VPAD, hot = held || toneHot == TN_VPAD;
+    const bool neutral = g.colorX.load() == 0 && g.colorY.load() == 0;
+    panel(dc, r, C_BACK, hot ? C_GOLD : C_EDGE);
+    const int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
+    {
+        PixelSnap px(dc);
+        const RECT in = px.inside(r);
+        const int t = px.line();
+        HBRUSH b = CreateSolidBrush(C_DIM);
+        const RECT down = {px.x((float)cx), in.top + 40, px.x((float)cx) + t, in.bottom - 6};
+        const RECT across = {in.left + 6, px.y((float)cy), in.right - 6, px.y((float)cy) + t};
+        FillRect(dc, &down, b);
+        FillRect(dc, &across, b);
+        DeleteObject(b);
+    }
+    // The top half carries the echo: shade it a little, more towards the top.
+    {
+        Gdiplus::Graphics gr(dc);
+        Gdiplus::LinearGradientBrush shade(Gdiplus::PointF((float)cx, (float)r.top + 1), Gdiplus::PointF((float)cx, (float)cy),
+                                           gpColor(C_GOLD, 34), gpColor(C_GOLD, 0));
+        gr.FillRectangle(&shade, (float)r.left + 1, (float)r.top + 1, (float)(r.right - r.left - 2), (float)(cy - r.top - 1));
+    }
+    const RECT fx = {cx - 70, r.top + 6, cx + 70, r.top + 22}, bright = {cx - 70, r.top + 20, cx + 70, r.top + 36};
+    boxText(dc, fx, L"\x2191 fx echo", C_DIM, fntUI, DT_CENTER);
+    boxText(dc, bright, L"brightness", C_DIM, fntUI, DT_CENTER);
+    boxText(dc, RECT{r.left + 8, r.bottom - 22, r.left + 60, r.bottom - 6}, L"Lo", C_DIM, fntBold, DT_LEFT);
+    boxText(dc, RECT{r.right - 60, r.bottom - 22, r.right - 8, r.bottom - 6}, L"Hi", C_DIM, fntBold, DT_RIGHT);
+    const POINT d = voiceColorPoint();
+    Gdiplus::Graphics gr(dc);
+    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::SolidBrush halo(gpColor(C_GOLD, held ? 90 : 50));
+    gr.FillEllipse(&halo, d.x - 14.0f, d.y - 14.0f, 28.0f, 28.0f);
+    roundBox(gr, d.x - 8.0f, d.y - 8.0f, 16.0f, 16.0f, 3.0f, neutral ? mixc(C_GOLD, C_DIM, 0.5) : C_GOLD, 255, C_KNOB);
+}
+
 static void paintTone(HDC dc, const RECT& rc) {
     boxTitle(dc, rc, L"Tone", RN_CLOSE, toneHot == TN_CLOSE);
     const bool live = g.toneOn.load();
     panel(dc, RN_PANEL, C_PANEL, C_EDGE);
     label(dc, 24, RN_PANEL.top + 8, L"Tone", C_GOLD, fntBold);
     {
-        const RECT hint = {80, RN_PANEL.top + 8, rc.right - 24, RN_PANEL.top + 24};
+        const RECT hint = {80, RN_PANEL.top + 8, RN_PAD.right, RN_PANEL.top + 24};
         boxText(dc, hint, L"Lo 200 Hz, Mid 1 kHz, Hi 3.5 kHz", C_DIM, fntUI, DT_RIGHT);
     }
     drawCheck(dc, RN_ON.left, RN_ON.top, live, L"Tone on");
     iconButton(dc, RN_FLAT, ICO_RESET, L"Flat", toneHot == TN_FLAT);
     paintTonePad(dc, live);
+    label(dc, RV_PAD.left, RN_PANEL.top + 8, L"Voice", C_GOLD, fntBold);
+    {
+        const RECT hint = {RV_PAD.left + 60, RN_PANEL.top + 8, RV_PAD.right, RN_PANEL.top + 24};
+        boxText(dc, hint, L"Color panel", C_DIM, fntUI, DT_RIGHT);
+    }
+    iconButton(dc, RV_CENTER, ICO_RESET, L"Center", toneHot == TN_VCENTER, g.colorX.load() != 0 || g.colorY.load() != 0);
+    paintVoicePad(dc);
     HPEN sep = linePen(C_EDGE);
     HGDIOBJ oldSep = SelectObject(dc, sep);
     MoveToEx(dc, 24, RN_VOCAL_Y, nullptr);
@@ -7425,6 +7511,7 @@ static LRESULT CALLBACK toneProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         boxTrackLeave(h, toneMouse);
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
         if (toneDrag == TN_PAD) { setTonePadFromPoint(h, p); return 0; }
+        if (toneDrag == TN_VPAD) { setVoiceColorFromPoint(h, p); return 0; }
         if (toneDrag >= 0 && toneDrag < 5) { setVocalFader(h, toneDrag, p.x); return 0; }
         const int hit = toneHit(p);
         if (hit != toneHot) {
@@ -7444,6 +7531,7 @@ static LRESULT CALLBACK toneProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
         const int hit = toneHit(p);
         if (hit == TN_PAD) { setTonePad(h, 0, 0); return 0; }
+        if (hit == TN_VPAD) { setVoiceColor(h, 0, 0); return 0; }
         if (hit >= 0 && hit < 5) { setVocalKnob(h, hit, vocalKnobDefault(hit)); return 0; }
         return toneProc(h, WM_LBUTTONDOWN, w, l);
     }
@@ -7455,6 +7543,13 @@ static LRESULT CALLBACK toneProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case TN_ON: g.toneOn = !g.toneOn.load(); toneChanged(h); return 0;
         case TN_FLAT: toneFlat(h); return 0;
         case TN_RESET: vocalReset(h); return 0;
+        case TN_VCENTER: setVoiceColor(h, 0, 0); return 0;
+        case TN_VPAD:
+            toneDrag = TN_VPAD;
+            SetCapture(h);
+            setVoiceColorFromPoint(h, p);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
         case TN_PAD:
             toneDrag = TN_PAD;
             SetCapture(h);
@@ -7491,6 +7586,7 @@ static LRESULT CALLBACK toneProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const int d = GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA;
         if (d == 0) return 0;
         if (PtInRect(&RN_PAD, p)) setTonePad(h, g.tonePadX.load(), g.tonePadY.load() + d * 5);
+        else if (PtInRect(&RV_PAD, p)) setVoiceColor(h, g.colorX.load(), g.colorY.load() + d * 5);
         else if (const int k = vocalFaderAt(p); k >= 0) setVocalKnob(h, k, vocalKnob(k).load() + d * (k == 0 ? 1 : 5));
         return 0;
     }
