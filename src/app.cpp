@@ -6223,8 +6223,9 @@ static const int PR_W = 346, PR_H = 146;
 static const RECT R_PR_CLOSE = {PR_W - 34, 5, PR_W - 8, 29}, R_PR_BOX = {24, 58, PR_W - 24, 86};
 static const RECT R_PR_OK = {PR_W - 158, 98, PR_W - 96, 124}, R_PR_CANCEL = {PR_W - 86, 98, PR_W - 24, 124};
 static bool hotPrOk = false, hotPrCancel = false, hotPrClose = false;
+static std::wstring promptTitle = L"Setup name";
 static void paintPrompt(HDC dc, const RECT& rc) {
-    boxTitle(dc, rc, L"Setup name", R_PR_CLOSE, hotPrClose);
+    boxTitle(dc, rc, promptTitle.c_str(), R_PR_CLOSE, hotPrClose);
     panel(dc, RECT{12, 46, rc.right - 12, rc.bottom - 12}, C_PANEL, C_EDGE);
     panel(dc, R_PR_BOX, C_BACK, C_EDGE);
     primaryButton(dc, R_PR_OK, ICO_NONE, L"OK", hotPrOk);
@@ -6270,8 +6271,10 @@ static LRESULT CALLBACK promptProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     return DefWindowProcW(h, m, w, l);
 }
-static std::wstring askSetupName(HWND owner, const std::wstring& initial) {
+// The small one-line box in Pixl's look. Returns what was typed, or an empty string on Cancel.
+static std::wstring askText(HWND owner, const std::wstring& title, const std::wstring& initial) {
     RECT o; GetWindowRect(owner, &o);
+    promptTitle = title;
     const int W = PR_W, H = PR_H;
     HWND h = CreateWindowExW(WS_EX_TOOLWINDOW, L"PixlPrompt", L"Pixl", WS_POPUP,
                              (o.left + o.right - sc(W)) / 2, (o.top + o.bottom - sc(H)) / 2, sc(W), sc(H),
@@ -6296,7 +6299,37 @@ static std::wstring askSetupName(HWND owner, const std::wstring& initial) {
     boxClose(h);
     hPromptEdit = nullptr;
     SetForegroundWindow(owner);
-    return promptResult == 1 ? cleanName(buf) : L"";
+    return promptResult == 1 ? std::wstring(buf) : L"";
+}
+
+static std::wstring askSetupName(HWND owner, const std::wstring& initial) {
+    const std::wstring typed = askText(owner, L"Setup name", initial);
+    return typed.empty() ? L"" : cleanName(typed.c_str());
+}
+
+static std::wstring fmtNumber(double v, int places) {
+    wchar_t t[32];
+    swprintf_s(t, 32, L"%.*f", places, v);
+    return t;
+}
+
+// Asks for a number between `least` and `most` and returns it in `out`. Accepts Arabic digits and
+// a comma for the decimal point. False when the box was cancelled or held no number.
+static bool askNumber(HWND owner, const std::wstring& title, double current, int places, double least, double most, double& out) {
+    wchar_t now[32];
+    swprintf_s(now, 32, places > 0 ? L"%.*f" : L"%.0f", places, current);
+    std::wstring typed = askText(owner, title + L"  (" + fmtNumber(least, places) + L" to " + fmtNumber(most, places) + L")", now);
+    for (auto& c : typed) {
+        if (c >= 0x0660 && c <= 0x0669) c = (wchar_t)(L'0' + (c - 0x0660));  // Arabic-Indic digits
+        else if (c >= 0x06F0 && c <= 0x06F9) c = (wchar_t)(L'0' + (c - 0x06F0));
+        else if (c == L',' || c == 0x066B) c = L'.';
+        else if (c == 0x2212) c = L'-';
+    }
+    wchar_t* end = nullptr;
+    const double v = wcstod(typed.c_str(), &end);
+    if (typed.empty() || end == typed.c_str()) return false;
+    out = v < least ? least : (v > most ? most : v);
+    return true;
 }
 
 static float colH = 0.1f, colS = 0.83f, colV = 0.94f;
@@ -7537,6 +7570,18 @@ static LRESULT CALLBACK toneProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_LBUTTONDOWN: {
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        for (int k = 0; k < 5; ++k) {
+            // The number after a Vocal fader: click it to type a value.
+            const RECT& r = *VOCAL_FADERS[k];
+            const RECT num = {r.right + 9, r.top, r.right + 84, r.bottom};  // clear of the fader's own grab area
+            if (!PtInRect(&num, p)) continue;
+            const double scale = k == 0 ? 1.0 : 10.0;  // Strength is a plain number, the rest are tenths of a dB
+            double typed = 0.0;
+            const std::wstring title = std::wstring(VOCAL_NAMES[k]) + (k == 0 ? L"" : L" (dB)");
+            if (askNumber(h, title, vocalKnob(k).load() / scale, k == 0 ? 0 : 1, vocalKnobMin(k) / scale, vocalKnobMax(k) / scale, typed))
+                setVocalKnob(h, k, (int)lround(typed * scale));
+            return 0;
+        }
         const int hit = toneHit(p);
         switch (hit) {
         case TN_CLOSE: boxClose(h); return 0;
@@ -10250,6 +10295,24 @@ static LRESULT CALLBACK mixerProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
         const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        for (int i = 0; i < mixer::STRIPS; ++i) {
+            // The dB number under a fader: click it to type a value.
+            const RECT num = {mixX(i) + 6, MIX_TOP + 460, mixX(i) + 72, MIX_TOP + 484};
+            if (!PtInRect(&num, p)) continue;
+            int db10;
+            { std::lock_guard<std::mutex> lk(gMix.mx); db10 = gMix.strips[i].db10; }
+            double typed = 0.0;
+            const std::wstring title = L"Audio " + std::to_wstring(i + 1) + L" volume (dB)";
+            if (askNumber(h, title, db10 / 10.0, 1, mixer::MIN_DB10 / 10.0, 0.0, typed)) {
+                {
+                    std::lock_guard<std::mutex> lk(gMix.mx);
+                    gMix.strips[i].db10 = std::max(mixer::MIN_DB10, std::min(0, (int)lround(typed * 10.0)));
+                }
+                mixSave();
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        }
         const int hit = mixHit(p);
         if (m == WM_LBUTTONDBLCLK && hit >= MH_STRIP && (hit - MH_STRIP) % MH_SPAN == MS_FADER) {
             // Double-click a fader to put it back at 0 dB.
@@ -13354,6 +13417,71 @@ static void ghostClear() {
     dropStop();
 }
 
+// Clicking the number next to a slider opens a box to type the value instead of dragging.
+struct ValueSpot {
+    int knob;
+    RECT r;              // where the number is drawn
+    const wchar_t* name;
+    double least, most;  // in the units the number shows
+    int places;
+};
+
+static std::vector<ValueSpot> valueSpots() {
+    auto after = [](const RECT& f, int gap, int y, int w) { return RECT{f.right + gap - 2, y - 3, f.right + gap + w, y + 17}; };
+    std::vector<ValueSpot> v = {
+        {K_AMOUNT, RECT{448, TITLE_H + 151, 556, TITLE_H + 171}, L"Effects amount", 0, 100, 0},
+        {K_MIC, RECT{448, 261, 560, 281}, L"Microphone level", 0, MIC_MAX, 0},
+        {K_ISO, after(R_ISOLVL, 8, TITLE_H + 80, 44), L"Noise isolation", 0, 100, 0},
+        {K_PITCH, after(R_PITCH, 8, VOICE_Y + 37, 70), L"Pitch (Hz)", -PITCH_SPAN, PITCH_SPAN, 0},
+        {K_SIZE, after(R_SIZE, 8, VOICE_Y + 37, 56), L"Size (%)", VSIZE_MIN, VSIZE_MAX, 0},
+        {K_VOICE, after(R_VOICE, 8, VOICE_Y + 70, 100), L"Voice changer", -100, 100, 0},
+        {K_VSPEED, after(R_VSPEED, 8, VOICE_Y + 102, 60), L"Speed (x)", SPEED_MIN / 100.0, SPEED_MAX / 100.0, 2},
+        {K_CLIP_VOL, after(R_CLIP_VOL, 10, CLIP_Y + 89, 50), L"Clip volume", 0, CLIP_MAX, 0},
+        {K_CLIP_SPEED, after(R_CLIP_SPEED, 10, CLIP_Y + 125, 60), L"Clip speed (x)", SPEED_MIN / 100.0, SPEED_MAX / 100.0, 2},
+        {K_APP, after(R_APP_VOL, 10, R_APP_VOL.top + 3, 50), L"Program level", 0, APP_MAX, 0},
+        {K_EQ_LEVEL, RECT{EQ_LVX - 18, EQ_FT - 27, EQ_LVX + 18, EQ_FT - 7}, L"Equalizer level (dB)", -eqb::EQ_LEVEL_RANGE, 0, 0},
+    };
+    for (int k = 0; k < eqb::EQ_BANDS; ++k) {
+        const int x = eqFaderX(k);
+        v.push_back({K_EQ + k, RECT{x - 18, EQ_FT - 27, x + 18, EQ_FT - 7}, L"Band (dB)", -eqb::EQ_RANGE, eqb::EQ_RANGE, 0});
+    }
+    return v;
+}
+
+// The knob's value in the units its number shows, and back.
+static double knobShown(int k) {
+    const int v = knobValue(k);
+    if (k == K_VSPEED || k == K_CLIP_SPEED) return v / 100.0;
+    if (k == K_EQ_LEVEL) return -v;
+    return v;
+}
+static int knobFromShown(int k, double shown) {
+    if (k == K_VSPEED || k == K_CLIP_SPEED) {
+        if (shown > 10.0) shown /= 100.0;  // "125" means 1.25x
+        return (int)lround(shown * 100.0);
+    }
+    if (k == K_EQ_LEVEL) return (int)lround(-shown);
+    return (int)lround(shown);
+}
+
+static bool askKnobAt(HWND h, POINT p) {
+    for (const ValueSpot& s : valueSpots()) {
+        if (!PtInRect(&s.r, p)) continue;
+        double typed = 0.0;
+        if (!askNumber(h, s.name, knobShown(s.knob), s.places, s.least, s.most, typed)) return true;
+        const int v = knobFromShown(s.knob, typed);
+        if (uiAnim) glideKnobTo(h, s.knob, v);
+        else {
+            knobSet(s.knob, v);
+            knobSettle(s.knob);
+        }
+        if (!glides[s.knob].on) knobSettle(s.knob);
+        InvalidateRect(h, nullptr, FALSE);
+        return true;
+    }
+    return false;
+}
+
 static const UINT WM_UPD_BLOCKED = WM_APP + 63, WM_UPD_FORCED = WM_APP + 64;
 static update::Control updControl;  // written by the watcher before it posts WM_UPD_BLOCKED or WM_UPD_FORCED
 static bool updForced = false;
@@ -13667,6 +13795,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             invalidateDesign(h, R_DEV_REFRESH);
             return 0;
         }
+        if (!cablePanel && askKnobAt(h, p)) return 0;
         glideStop(knobAt(p));
         RECT grab = {R_SLIDER.left - 8, R_SLIDER.top - 10,
                      R_SLIDER.right + 8, R_SLIDER.bottom + 10};
@@ -14342,6 +14471,15 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             cableAsked = true;
             cablePanel = true;
             applyLayout();
+            InvalidateRect(h, nullptr, TRUE);
+            UpdateWindow(h);
+            // Without VB-CABLE nothing reaches Discord or games, so say it plainly.
+            if (g.cableStage.load() == STAGE_MISSING &&
+                MessageBoxW(h, L"VB-CABLE isn't installed on this PC.\n\n"
+                               L"Pixl needs it: it's the free virtual microphone that carries your voice to Discord and games. "
+                               L"Without it, the others won't hear Pixl's effects.\n\nInstall it now?",
+                            L"VB-CABLE is required", MB_YESNO | MB_ICONWARNING) == IDYES)
+                startCableDownload(h);
         }
         if (gApp.finished()) {
             appNote = appEndNote();
