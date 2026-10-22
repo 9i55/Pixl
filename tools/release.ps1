@@ -53,14 +53,20 @@ Set-Content "$out\Pixl.exe.sha256" "$hash  Pixl.exe" -Encoding ascii
 Compress-Archive -Path "$out\Pixl.exe", "$out\LICENSE.txt", "$out\NOTICE-OctopusEAX.txt" -DestinationPath "$out\Pixl.zip" -Force
 
 # 4. Commit, tag, push, release
-git add -A
-git commit -m "Pixl $Version" | Out-Null
-git tag $tag
-git push origin HEAD --tags
+# git and gh print notes on stderr; Windows PowerShell would treat them as errors, so check exit codes instead.
+$ErrorActionPreference = 'Continue'
+function Step([string]$what, [scriptblock]$run) {
+    & $run 2>&1 | ForEach-Object { "$_" } | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "$what failed" }
+}
+git add -A 2>&1 | Out-Null
+git diff --cached --quiet
+if ($LASTEXITCODE -ne 0) { Step 'git commit' { git commit -m "Pixl $Version" } }
+Step 'git tag' { git tag $tag }
+Step 'git push' { git push origin HEAD --tags }
 if (-not $Notes) { $Notes = "Pixl $Version" }
 $body = "$Notes`n`n**New here?** Download ``Pixl.zip``, unzip it into a folder that stays, and run ``Pixl.exe``.`n**Already have Pixl 1.1 or newer?** Click **Update to $Version** at the top of Pixl."
 $ghArgs = @('release', 'create', $tag, "$out\Pixl.zip", "$out\Pixl.exe", "$out\Pixl.exe.sha256", '--title', "Pixl $Version", '--notes', $body)
 if ($Draft) { $ghArgs += '--draft' } else { $ghArgs += '--latest' }
-& gh @ghArgs
-if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+Step 'gh release create' { gh @ghArgs }
 Write-Host "Released Pixl $Version"
