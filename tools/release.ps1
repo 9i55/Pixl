@@ -53,10 +53,10 @@ Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $out | Out-Null
 Copy-Item $exe "$out\Pixl.exe"
 Copy-Item LICENSE "$out\LICENSE.txt"
-Copy-Item NOTICE-OctopusEAX.txt "$out\NOTICE-OctopusEAX.txt"  # the original MIT notice must ship with every copy
+Copy-Item licenses\THIRD-PARTY-NOTICES.txt "$out\THIRD-PARTY-NOTICES.txt"  # third-party MIT notices must ship with every copy
 $hash = (Get-FileHash "$out\Pixl.exe" -Algorithm SHA256).Hash.ToLower()
 Set-Content "$out\Pixl.exe.sha256" "$hash  Pixl.exe" -Encoding ascii
-Compress-Archive -Path "$out\Pixl.exe", "$out\LICENSE.txt", "$out\NOTICE-OctopusEAX.txt" -DestinationPath "$out\Pixl.zip" -Force
+Compress-Archive -Path "$out\Pixl.exe", "$out\LICENSE.txt", "$out\THIRD-PARTY-NOTICES.txt" -DestinationPath "$out\Pixl.zip" -Force
 
 # 4. Commit, tag, push, release
 # git and gh print notes on stderr; Windows PowerShell would treat them as errors, so check exit codes instead.

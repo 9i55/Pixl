@@ -13358,12 +13358,14 @@ static const UINT WM_UPD_BLOCKED = WM_APP + 63, WM_UPD_FORCED = WM_APP + 64;
 static update::Control updControl;  // written by the watcher before it posts WM_UPD_BLOCKED or WM_UPD_FORCED
 static bool updForced = false;
 
-// Reads control.json right away and every 30 minutes (off switch, minimum version), and looks
+// Reads control.json right away and every 30 seconds (off switch, minimum version), and looks
 // for a newer release a few seconds after start, then every six hours. Offline, Pixl just runs.
 static void updWatch(HWND owner) {
     std::thread([owner] {
         const update::Version me = update::current();
-        for (int round = 0;; ++round) {
+        const ULONGLONG started = GetTickCount64();
+        ULONGLONG nextRelease = started + 5000;
+        for (;;) {
             update::Control c;
             if (update::control(c)) {
                 if (c.disabled) {
@@ -13380,16 +13382,16 @@ static void updWatch(HWND owner) {
                     return;
                 }
             }
-            if (round == 0) Sleep(5000);
-            if (round % 12 == 0 && updState.load() == 0) {
+            if (GetTickCount64() >= nextRelease) {
+                nextRelease = GetTickCount64() + 6ull * 60 * 60 * 1000;
                 update::Latest l;
-                if (update::latest(l) && l.version.newerThan(me)) {
+                if (updState.load() == 0 && update::latest(l) && l.version.newerThan(me)) {
                     updLatest = l;
                     updState = 1;
                     PostMessageW(owner, WM_UPD_FOUND, 0, 0);
                 }
             }
-            Sleep(30 * 60 * 1000);
+            Sleep(GetTickCount64() - started < 5000 ? 5000 : 30 * 1000);
         }
     }).detach();
 }

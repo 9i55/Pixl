@@ -142,12 +142,19 @@ struct Control {
     std::wstring message;
 };
 
+inline void readControl(const std::string& json, Control& out) {
+    out.disabled = jsonTrue(json, "disabled");
+    out.minVersion = Version::parse(jsonString(json, "minVersion"));
+    out.message = wide(jsonString(json, "message"));
+}
+
+// GitHub keeps the raw file cached for five minutes; a query that changes every time makes
+// it read the file fresh, so an edit to the gist is seen on the next check.
 inline bool control(Control& out) {
     std::string body;
-    if (!fetch(PIXL_CONTROL_URL, &body, L"", 64 * 1024)) return false;
-    out.disabled = jsonTrue(body, "disabled");
-    out.minVersion = Version::parse(jsonString(body, "minVersion"));
-    out.message = wide(jsonString(body, "message"));
+    const std::wstring url = std::wstring(PIXL_CONTROL_URL) + L"?t=" + std::to_wstring(GetTickCount64());
+    if (!fetch(url, &body, L"", 64 * 1024)) return false;
+    readControl(body, out);
     return true;
 }
 
