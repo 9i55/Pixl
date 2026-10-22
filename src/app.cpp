@@ -7569,7 +7569,6 @@ static void paintAbout(HDC dc, const RECT& rc) {
     label(dc, 24, 150, L"sexuility", C_TEXT, fntBold);
     label(dc, 24, 170, L"sothls", C_TEXT, fntBold);
     label(dc, 24, 204, L"Version " PIXL_VERSION_STR, C_DIM, fntUI);
-    label(dc, 24, 222, L"Based on OctopusEAX (MIT License)", C_DIM, fntUI);
     primaryButton(dc, aboutOk(rc), ICO_NONE, L"OK", aboutHot == 1);
     boxEdge(dc);
 }

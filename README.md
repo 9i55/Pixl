@@ -149,11 +149,7 @@ The program is written to `build\MasonEAX\Pixl.exe`.
 
 ---
 
-## Credits
-
-Pixl is based on [OctopusEAX](https://github.com/ALMASONYH/OctopusEAX) by ABOLHB / ALMASONYH, released under the MIT License. Pixl adds the program mixer, the soundboard drag and drop, and a new look, and keeps the same license. See [LICENSE](LICENSE) and [NOTICE-OctopusEAX.txt](NOTICE-OctopusEAX.txt).
-
-### Publishing an update (maintainer)
+## Publishing an update (maintainer)
 
 With Visual Studio 2022, git and the GitHub CLI signed in to the repo's account:
 
@@ -162,3 +158,7 @@ With Visual Studio 2022, git and the GitHub CLI signed in to the repo's account:
 ```
 
 The script sets the version, builds, uploads `Pixl.zip`, `Pixl.exe` and `Pixl.exe.sha256`, and creates the release. Everyone on 1.1 or newer gets the update button.
+
+## License
+
+MIT License. Copyright (c) 2026 9i55. See [LICENSE](LICENSE).
