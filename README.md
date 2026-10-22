@@ -151,7 +151,9 @@ The program is written to `build\MasonEAX\Pixl.exe`.
 
 ## Publishing an update (maintainer)
 
-With Visual Studio 2022, git and the GitHub CLI signed in to the repo's account:
+**From GitHub:** open **Actions → Publish update → Run workflow**, type the new version (higher than the last one, like `1.2.0`) and what changed, then click **Run workflow**. GitHub builds Pixl and publishes the release in a few minutes.
+
+**From your PC**, with Visual Studio 2022, git and the GitHub CLI signed in to the repo's account:
 
 ```powershell
 .\tools\release.ps1 -Version 1.2.0 -Notes "What changed"

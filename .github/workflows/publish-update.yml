@@ -1,0 +1,36 @@
+# Actions -> Publish update -> Run workflow: builds Pixl on GitHub and publishes it as a
+# new release. Everyone on Pixl 1.1 or newer then sees "Update to <version>" in the app.
+name: Publish update
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version number, higher than the last one (like 1.2.0)"
+        required: true
+      notes:
+        description: "What changed (shown on the release page)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          git config user.name "9i55"
+          git config user.email "346131822+9i55@users.noreply.github.com"
+          ./tools/release.ps1 -Version $env:VERSION -Notes $env:NOTES

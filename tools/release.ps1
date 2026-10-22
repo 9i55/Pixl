@@ -4,6 +4,9 @@ within a few hours (or the next time they open it) and can install it with one c
 
   .\tools\release.ps1 -Version 1.2.0 -Notes "What changed in this version"
 
+Or, without a PC set up for building: on GitHub open Actions -> Publish update -> Run workflow,
+which runs this same script on GitHub's machines.
+
 It sets the version in src\version.hpp, builds, makes Pixl.zip plus Pixl.exe and its SHA-256
 (the app checks the download against it), commits, tags and creates the GitHub release.
 Needs Visual Studio 2022 (C++), git and the GitHub CLI (gh) signed in to the repo's account.
@@ -21,6 +24,9 @@ $parts = $Version.Split('.')
 $tag = "v$Version"
 
 if (git tag --list $tag) { throw "$tag already exists" }
+# The app only offers versions higher than its own, so a lower number would reach nobody.
+$was = [regex]::Match((Get-Content src\version.hpp -Raw), '#define PIXL_VERSION_STR "([^"]+)"').Groups[1].Value
+if ($was -and ([version]$Version -le [version]$was)) { throw "Version $Version must be higher than the current $was" }
 if (git status --porcelain) { Write-Host "Committing the changes in the working tree with the release." }
 
 # 1. Version
@@ -63,7 +69,10 @@ git add -A 2>&1 | Out-Null
 git diff --cached --quiet
 if ($LASTEXITCODE -ne 0) { Step 'git commit' { git commit -m "Pixl $Version" } }
 Step 'git tag' { git tag $tag }
-Step 'git push' { git push origin HEAD --tags }
+$branch = (git rev-parse --abbrev-ref HEAD).Trim()
+if ($branch -eq 'HEAD') { $branch = 'main' }  # GitHub Actions may check out without a branch
+Step 'git push' { git push origin "HEAD:refs/heads/$branch" }
+Step 'git push tag' { git push origin "refs/tags/$tag" }
 if (-not $Notes) { $Notes = "Pixl $Version" }
 $body = "$Notes`n`n**New here?** Download ``Pixl.zip``, unzip it into a folder that stays, and run ``Pixl.exe``.`n**Already have Pixl 1.1 or newer?** Click **Update to $Version** at the top of Pixl."
 $ghArgs = @('release', 'create', $tag, "$out\Pixl.zip", "$out\Pixl.exe", "$out\Pixl.exe.sha256", '--title', "Pixl $Version", '--notes', $body)
