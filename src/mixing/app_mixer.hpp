@@ -39,6 +39,7 @@ struct Mixer {
     std::atomic<bool> echoLive{false};
     std::atomic<bool> echoAny{false};  // some program has Echo on (heard or mic only)
     std::wstring skipName;
+    std::wstring duckName;  // the program Pixl turned down to play it itself: its volume is Pixl's
     std::function<std::wstring()> cableFinder;  // id of the VB-CABLE playback device (the mic path)
 
     Mixer() {
@@ -282,12 +283,13 @@ private:
 
     void step() {
         Strip snap[STRIPS];
-        std::wstring outIds[OUTS], skip;
+        std::wstring outIds[OUTS], skip, duck;
         {
             std::lock_guard<std::mutex> lk(mx);
             for (int i = 0; i < STRIPS; ++i) snap[i] = strips[i];
             for (int o = 0; o < OUTS; ++o) outIds[o] = outs[o];
             skip = skipName;
+            duck = duckName;
         }
         bool anySolo = false;
         for (const Strip& s : snap) anySolo = anySolo || s.solo;
@@ -314,8 +316,9 @@ private:
         for (Session& s : list) {
             const int i = stripFor(s.name);
             const std::wstring key = lower(s.name);
+            const bool ducked = !duck.empty() && sameName(s.name, duck);
             if (i >= 0) {
-                if (s.vol) {
+                if (s.vol && !ducked) {
                     auto seen = touched.find(key);
                     if (seen == touched.end()) {
                         float v = 1.0f;
@@ -331,7 +334,7 @@ private:
                 auto& v = pidsOf[key];
                 if (std::find(v.begin(), v.end(), s.pid) == v.end()) v.push_back(s.pid);
                 if (!rootOf.count(key)) rootOf[key] = table.root(s.pid);
-            } else if (touched.count(key)) {
+            } else if (touched.count(key) && !ducked) {
                 // Taken out of every strip: give back the volume it had.
                 if (s.vol) s.vol->SetMasterVolume(touched[key].firstVolume, nullptr);
             }
@@ -430,11 +433,16 @@ private:
             echoLive = false;
             echoAny = false;
         }
+        std::wstring duck;
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            duck = duckName;
+        }
         const clip::ProcessTable table;
         std::vector<Session> list = sessions(table);
         for (Session& s : list) {
             auto t = touched.find(lower(s.name));
-            if (t != touched.end() && s.vol) s.vol->SetMasterVolume(t->second.firstVolume, nullptr);
+            if (t != touched.end() && s.vol && !(!duck.empty() && sameName(s.name, duck))) s.vol->SetMasterVolume(t->second.firstVolume, nullptr);
             if (s.vol) s.vol->Release();
             if (s.meter) s.meter->Release();
         }

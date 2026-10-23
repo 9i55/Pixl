@@ -416,9 +416,23 @@ struct AppTakeover {
     std::atomic<bool> taken{false};
     DWORD targetPid = 0;
 
+    // Ducking, for a PC with nowhere to park the program: it keeps playing where it plays, but Windows turns it down to
+    // kDuck before Pixl captures it, so nobody hears the original, and Pixl lifts its copy by the same amount (float all
+    // the way: nothing is lost). The volume it had comes back when Pixl lets go, and after a crash on the next start.
+    static constexpr float kDuck = 0.001f;
+    bool ducking = false;
+    float userVolume = 1.0f;          // the program's own volume: the copy plays at this
+    std::atomic<float> boost{0.0f};   // the capture is multiplied by this; 0 while the volume is changing hands
+    std::atomic<bool> rescan{false};  // the capture heard the program at full volume: a new sound, or someone moved it
+    ULONGLONG settleAt = 0;
+    std::vector<ISimpleAudioVolume*> held;
+    std::vector<std::wstring> heldExe;
+    ParkMemory duckMemory;            // exe -> its volume, while it is turned down
+
     ~AppTakeover() { restore(); }
 
-    void unmuteSessions(DWORD root) {
+    // Every sound session of the program and its children, on every output.
+    template <class Fn> static void forSessions(DWORD root, Fn fn) {
         std::vector<DWORD> tree;
         collectTree(root, tree);
         IMMDeviceEnumerator* en = nullptr;
@@ -448,14 +462,11 @@ struct AppTakeover {
                         DWORD spid = 0;
                         if (SUCCEEDED(sc->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&sc2)) && sc2) {
                             sc2->GetProcessId(&spid);
-                            if (spid && pidInList(tree, spid)) {
+                            // Never Pixl's own: turning down its capture would silence the copy.
+                            if (spid && spid != GetCurrentProcessId() && pidInList(tree, spid)) {
                                 ISimpleAudioVolume* av = nullptr;
                                 if (SUCCEEDED(sc->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&av)) && av) {
-                                    float vol = 1.f;
-                                    BOOL muted = FALSE;
-                                    av->GetMasterVolume(&vol);
-                                    if (vol < 0.01f) av->SetMasterVolume(1.f, nullptr);
-                                    if (FAILED(av->GetMute(&muted)) || muted) av->SetMute(FALSE, nullptr);
+                                    fn(spid, av);
                                     av->Release();
                                 }
                             }
@@ -471,6 +482,94 @@ struct AppTakeover {
         }
         col->Release();
         en->Release();
+    }
+
+    static bool isDucked(float v) { return fabsf(v - kDuck) < kDuck * 0.02f; }
+
+    void releaseHeld() {
+        for (ISimpleAudioVolume* av : held) av->Release();
+        held.clear();
+    }
+
+    void remember() {
+        const std::wstring v = std::to_wstring(userVolume);
+        ParkMemory::Entry e;
+        e.prev[0] = v;
+        for (const std::wstring& exe : heldExe) duckMemory.put(exe, e);
+    }
+
+    // A volume that is not ours: the program's own (first look), or one somebody just moved it to.
+    void takeVolume(ISimpleAudioVolume* av, float v, bool first) {
+        boost = 0.0f;
+        userVolume = first ? (v < 0.01f ? 1.0f : v) : v;
+        av->SetMasterVolume(kDuck, nullptr);
+        settleAt = GetTickCount64() + 200;
+        remember();
+    }
+
+    // Finds the program's sessions again and turns down any that are not yet.
+    void duckSessions(DWORD root) {
+        const bool first = !taken.load();
+        if (first) {
+            ParkMemory::Entry e;
+            const std::wstring exe = imagePath(root);
+            if (duckMemory.get(exe, e) && !e.prev[0].empty()) userVolume = (std::min)(1.0f, (std::max)(0.0f, wcstof(e.prev[0].c_str(), nullptr)));
+        }
+        releaseHeld();
+        std::vector<std::wstring> exes;
+        forSessions(root, [&](DWORD spid, ISimpleAudioVolume* av) {
+            BOOL muted = FALSE;
+            if (FAILED(av->GetMute(&muted)) || muted) av->SetMute(FALSE, nullptr);
+            const std::wstring exe = imagePath(spid);
+            if (!exe.empty() && std::find(exes.begin(), exes.end(), exe) == exes.end()) exes.push_back(exe);
+            av->AddRef();
+            held.push_back(av);
+        });
+        const bool newExe = exes != heldExe;
+        heldExe = exes;
+        for (ISimpleAudioVolume* av : held) {
+            float v = 1.0f;
+            if (SUCCEEDED(av->GetMasterVolume(&v)) && !isDucked(v)) takeVolume(av, v, first);
+        }
+        if (newExe) remember();
+        if (boost.load() == 0.0f && !settleAt) settleAt = GetTickCount64() + 200;  // already down (Pixl took it before)
+        taken = true;
+    }
+
+    // Every few milliseconds: a volume somebody moved is taken over at once, and the copy comes back once it settled.
+    void watch() {
+        for (ISimpleAudioVolume* av : held) {
+            float v = kDuck;
+            if (SUCCEEDED(av->GetMasterVolume(&v)) && !isDucked(v)) takeVolume(av, v, false);
+        }
+        if (boost.load() == 0.0f && settleAt && GetTickCount64() >= settleAt) {
+            settleAt = 0;
+            boost = userVolume / kDuck;
+        }
+    }
+
+    void unduck() {
+        boost = 0.0f;
+        bool back = true;
+        for (ISimpleAudioVolume* av : held) back = SUCCEEDED(av->SetMasterVolume(userVolume, nullptr)) && back;
+        releaseHeld();
+        // A program that closed while turned down keeps that volume in Windows: it gets it back when it next opens.
+        if (back && targetPid && !imagePath(targetPid).empty())
+            for (const std::wstring& exe : heldExe) duckMemory.drop(exe);
+        heldExe.clear();
+        settleAt = 0;
+        userVolume = 1.0f;
+        rescan = false;
+    }
+
+    void unmuteSessions(DWORD root) {
+        forSessions(root, [](DWORD, ISimpleAudioVolume* av) {
+            float vol = 1.f;
+            BOOL muted = FALSE;
+            av->GetMasterVolume(&vol);
+            if (vol < 0.01f) av->SetMasterVolume(1.f, nullptr);
+            if (FAILED(av->GetMute(&muted)) || muted) av->SetMute(FALSE, nullptr);
+        });
     }
 
     void routeToPark(DWORD root, const std::wstring& parkId) {
@@ -563,6 +662,10 @@ struct AppTakeover {
     bool apply(DWORD root, const std::wstring& parkId) {
         if (!root) return taken.load();
         targetPid = root;
+        if (ducking) {
+            duckSessions(root);
+            return true;
+        }
         unmuteSessions(root);
         routeToPark(root, parkId);
         taken = !parkId.empty();
@@ -570,7 +673,8 @@ struct AppTakeover {
     }
 
     void restore() {
-        if (targetPid) unmuteSessions(targetPid);
+        if (!held.empty() || !heldExe.empty()) unduck();
+        else if (targetPid && !ducking) unmuteSessions(targetPid);
         if (!persist.empty()) {
             if (IAudioPolicyConfig* fac = openPolicy()) {
                 std::vector<std::wstring> back;
@@ -596,6 +700,32 @@ struct AppTakeover {
         targetPid = 0;
     }
 };
+
+// Programs left turned down (they closed while Pixl had them, or Pixl did not close cleanly): each gets its own volume
+// back the next time it plays, unless Pixl has it again.
+inline void healDucked(const ParkMemory& memory, const std::vector<std::wstring>& skip) {
+    const std::vector<std::wstring> programs = memory.programs();
+    if (programs.empty()) return;
+    const ProcessTable table;
+    for (const std::wstring& exe : programs) {
+        if (std::any_of(skip.begin(), skip.end(), [&](const std::wstring& s) { return _wcsicmp(s.c_str(), exe.c_str()) == 0; })) continue;
+        ParkMemory::Entry e;
+        if (!memory.get(exe, e)) continue;
+        const float back = (std::min)(1.0f, (std::max)(0.0f, wcstof(e.prev[0].c_str(), nullptr)));
+        const size_t slash = exe.find_last_of(L"\\/");
+        const std::wstring file = slash == std::wstring::npos ? exe : exe.substr(slash + 1);
+        bool found = false;
+        for (const ProcessTable::Row& r : table.rows) {
+            if (!r.pid || _wcsicmp(r.exe.c_str(), file.c_str()) != 0 || !sameProgram(r.pid, exe)) continue;
+            AppTakeover::forSessions(r.pid, [&](DWORD, ISimpleAudioVolume* av) {
+                found = true;
+                float v = 1.0f;
+                if (SUCCEEDED(av->GetMasterVolume(&v)) && AppTakeover::isDucked(v)) av->SetMasterVolume(back, nullptr);
+            });
+        }
+        if (found) memory.drop(exe);
+    }
+}
 
 typedef HRESULT (WINAPI * ActivateAudioFn)(LPCWSTR, REFIID, PROPVARIANT*, IActivateAudioInterfaceCompletionHandler*,
                                            IActivateAudioInterfaceAsyncOperation**);
@@ -738,6 +868,7 @@ struct ProgramTap {
     std::atomic<long> refusal{0};
     std::atomic<ULONGLONG> lastSound{0};
     std::atomic<bool> parking{false};
+    std::atomic<bool> ducking{false};  // the program is turned down where it plays, and this copy stands in for it
     bool handsOff = false;  // the mixer owns this program's volume, so never touch its sessions
     std::atomic<float> peakHold{0.0f};  // loudest sample since the meter last looked
     DWORD pid = 0;
@@ -745,15 +876,19 @@ struct ProgramTap {
     StereoRing ring;
     std::vector<float> tmp;
     std::vector<float> silence;
+    std::vector<float> lifted;
     AppTakeover hijack;
     std::wstring stealTo;
 
     ~ProgramTap() { stop(); }
 
-    void start(const Program& p, int fs, const std::wstring& stealId = {}) {
+    void start(const Program& p, int fs, const std::wstring& stealId = {}, bool duck = false) {
         stop();
         pid = p.pid; name = p.name; stealTo = stealId;
         parking = !stealId.empty();
+        hijack.ducking = duck && stealId.empty() && !handsOff;
+        hijack.boost = 0.0f;
+        ducking = hijack.ducking;
         quit = false; refusal = 0; lastSound = 0;
         ring.init((UINT32)fs, (UINT32)(fs * 40 / 1000), (UINT32)(fs * 10 / 1000));
         state = OPENING;
@@ -765,7 +900,9 @@ struct ProgramTap {
         if (th.joinable()) th.join();
         if (keeper.joinable()) keeper.join();
         hijack.restore();
+        hijack.ducking = false;
         parking = false;
+        ducking = false;
         state = OFF;
     }
     bool active() const { return state.load() == CAPTURING; }
@@ -849,6 +986,19 @@ private:
             if (s) {
                 for (UINT32 i = 0; i < n * 2; ++i) peak = std::max(peak, fabsf(s[i]));
             }
+            if (s && n && hijack.ducking) {
+                // Turned down: lifted back to the program's own level. Sound that comes through at full volume is
+                // changing hands (a new sound, or somebody moved its volume) and is heard from the program itself.
+                float gain = hijack.boost.load();
+                if (peak > AppTakeover::kDuck * 4.0f) {
+                    if (gain > 0.0f) hijack.rescan = true;
+                    gain = 0.0f;
+                }
+                lifted.resize((size_t)n * 2);
+                for (UINT32 i = 0; i < n * 2; ++i) lifted[i] = s[i] * gain;
+                s = lifted.data();
+                peak *= gain;
+            }
             if (!s || n == 0 || peak < 1e-7f) {
                 if (silence.size() < (size_t)n * 2) silence.assign((size_t)n * 2, 0.f);
                 ring.push(silence.data(), n);
@@ -907,12 +1057,15 @@ private:
         const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ULONGLONG due = 0;
         while (!quit.load() && !finished()) {
+            const ULONGLONG now = GetTickCount64();
             if (state.load() != CAPTURING) due = 0;
-            else if (!handsOff && GetTickCount64() >= due) {
+            else if (!handsOff && (now >= due || (now + 1750 >= due && hijack.rescan.exchange(false)))) {
                 hijack.apply(pid, stealTo);
                 due = GetTickCount64() + 2000;
+            } else if (!handsOff && hijack.ducking) {
+                hijack.watch();
             }
-            Sleep(50);
+            Sleep(hijack.ducking ? 20 : 50);
         }
         hijack.restore();
         if (SUCCEEDED(com)) CoUninitialize();

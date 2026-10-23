@@ -488,20 +488,34 @@ static bool appToMonitor() { return !g.appHear.load() || g.appOnly.load(); }
 
 static std::wstring appParkName;
 
+// With nowhere to park the program and Pixl playing it to you, the program is turned down where it plays and Pixl's
+// copy (its effects, its level) takes its place: heard once, from the same headphones.
+static bool appDuckWanted(const std::wstring& park) { return park.empty() && appToMonitor(); }
+
 static void appPick(const clip::Program& p) {
     const std::wstring park = findParkRender(appToMonitor());
+    const bool duck = appDuckWanted(park);
     appParkName = renderName(park);
     {
         // The program on the mic picks its own output, so the mixer leaves its routing alone.
         std::lock_guard<std::mutex> lk(gMix.mx);
         gMix.skipName = park.empty() ? L"" : p.name;
+        gMix.duckName = duck ? p.name : L"";
     }
-    gApp.start(p, FS, park);
+    gApp.start(p, FS, park, duck);
+}
+
+static void appDrop() {
+    gApp.stop();
+    std::lock_guard<std::mutex> lk(gMix.mx);
+    gMix.skipName.clear();
+    gMix.duckName.clear();
 }
 
 static void appRepark() {
     if (!gApp.chosen()) return;
-    if (findParkRender(appToMonitor()) != gApp.stealTo) appPick(clip::Program{gApp.pid, gApp.name});
+    const std::wstring park = findParkRender(appToMonitor());
+    if (park != gApp.stealTo || appDuckWanted(park) != gApp.ducking.load()) appPick(clip::Program{gApp.pid, gApp.name});
 }
 
 static std::wstring monitorRenderId(const std::wstring& spkId) {
@@ -1542,7 +1556,7 @@ static void audioThread() {
                         if (mixOn) gMix.pull(mxL.data(), mxR.data(), meL.data(), meR.data(), moL.data(), moR.data(), mcL.data(), mcR.data(), (int)frames);
                         const float cg = micGainFor(g.clipGain.load());
                         const int appV = g.appGain.load();
-                        const bool hearApp = appToMonitor(), appOnly = g.appOnly.load(), appDryMon = hearApp && gApp.parking.load();
+                        const bool hearApp = appToMonitor(), appOnly = g.appOnly.load(), appDryMon = hearApp && (gApp.parking.load() || gApp.ducking.load());
                         const float agCab = micGainFor(appV);
 
                         const bool toMic = g.clipToMic.load(), clipHear = g.clipHear.load(), self = g.monitor.load();
@@ -3914,8 +3928,8 @@ static std::wstring appEndNote() {
 
 static void healPrograms() {
     static std::atomic<bool> busy{false};
-    const clip::ParkMemory memory = gApp.hijack.memory;
-    if (memory.programs().empty() || busy.exchange(true)) return;
+    const clip::ParkMemory memory = gApp.hijack.memory, ducked = gApp.hijack.duckMemory;
+    if ((memory.programs().empty() && ducked.programs().empty()) || busy.exchange(true)) return;
     std::vector<std::wstring> skip;
     if (gApp.chosen()) {
         std::vector<DWORD> tree;
@@ -3925,9 +3939,10 @@ static void healPrograms() {
             if (!exe.empty()) skip.push_back(exe);
         }
     }
-    std::thread([memory, skip] {
+    std::thread([memory, ducked, skip] {
         const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         clip::healParked(memory, skip);
+        clip::healDucked(ducked, skip);
         if (SUCCEEDED(com)) CoUninitialize();
         busy = false;
     }).detach();
@@ -5322,6 +5337,8 @@ static const wchar_t* appRouteNote() {
     if (aux) return g.appHear.load() ? L"The original plays on Aux, so turn off A1 there. What U Hear gets the processed sound only."
                                      : L"The original stays on Aux. What U Hear follows the level above. Input and A1 are left alone.";
     if (!appParkName.empty()) return L"The original goes to Steam Streaming Speakers, so you hear it once, from the app.";
+    if (gApp.ducking.load()) return g.appOnly.load() ? L"Pixl turns the original down and plays it with your effects and level. Only you hear it."
+                                                     : L"Pixl turns the original down and plays it with your effects and level.";
     if (g.appOnly.load()) return L"The original plays on its own speakers, and only you hear it.";
     if (appToMonitor()) return L"The original plays on its own speakers, the app adds only its echo.";
     return L"The original plays on its own speakers.";
@@ -15214,11 +15231,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (id == ID_APP && code == CBN_SELCHANGE) {
             int i = (int)SendMessageW(hApp, CB_GETCURSEL, 0, 0);
             appNote.clear();
-            if (i <= 0) {
-                gApp.stop();
-                std::lock_guard<std::mutex> lk(gMix.mx);
-                gMix.skipName.clear();
-            }
+            if (i <= 0) appDrop();
             else if (i - 1 < (int)uiApps.size()) appPick(uiApps[i - 1]);
             InvalidateRect(h, nullptr, FALSE);
         } else if (id == ID_EQBOX && code == CBN_SELCHANGE) {
@@ -15304,7 +15317,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         if (gApp.finished()) {
             appNote = appEndNote();
-            gApp.stop();
+            appDrop();
             if (hApp) SendMessageW(hApp, CB_SETCURSEL, 0, 0);
         }
         static ULONGLONG healAt = 0;
@@ -15649,6 +15662,7 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     }
     makeFonts();
     gApp.hijack.memory.key = L"Software\\Pixl\\Parked";
+    gApp.hijack.duckMemory.key = L"Software\\Pixl\\Turned down";
     applyLook();
     buildBackground();
     startupOn = startupIsOn();
