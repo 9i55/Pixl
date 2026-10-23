@@ -161,6 +161,16 @@ static const CardPreset CARD_PRESETS[] = {
       0.128, 0.0,
       0.128, 0.0,
       0.994260, 5000.0, 250.0, 1}},
+  // Last, so the rooms keep the numbers saved setups know them by. The sound circles your head (spatial/eight_d.hpp);
+  // this is only its echo, a concert hall.
+  {"8D Audio", {1.000000, 1.00, 0.638263, 0.562341, 1.0,
+      3.92, 0.70, 1.0,
+      0.242661, 0.020,
+      0.997700, 0.029,
+      0.25, 0.0,
+      0.25, 0.0,
+      0.994260, 5000.0, 250.0, 1}},
 };
 static const int NUM_CARD_PRESETS = (int)(sizeof(CARD_PRESETS) / sizeof(CARD_PRESETS[0]));
 static const int HAUNTED_CAVERN_INDEX = 8;
+static const int EIGHT_D_INDEX = NUM_CARD_PRESETS - 1;
