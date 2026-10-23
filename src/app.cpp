@@ -265,8 +265,7 @@ enum { STAGE_MISSING, STAGE_RESTART, STAGE_READY, STAGE_PROBLEM };
 static int echoFromRoute(int route) { return route == 0 ? ON_VOICE | ON_CLIP : route == 1 ? ON_CLIP | ON_PROGRAM : ON_ALL; }
 
 static const int AMOUNT_DEFAULT = 9, MIC_DEFAULT = 100, ISO_DEFAULT = 60, CLIP_GAIN_DEFAULT = 84, APP_GAIN_DEFAULT = 80;
-static const int EIGHT_ECHO_AMOUNT = 35;  // 8D Audio's Echo at 100%, as an Effects amount: a hall around the sound
-static const int EIGHT_MAX = 200;         // its Bass, Clarity and Echo go to 200%
+static const int EIGHT_MAX = 200;         // 8D Audio's Bass, Clarity and Echo go to 200%
 static const int GATE_DEFAULT_DB = -170, GATE_OLD_LEVEL = 60, GATE_MIN_DB = -660, VOCAL_DEFAULT_LEVEL = iso::GATE_LEVEL_NORMAL;
 static const int GATE_DEFAULT_TONE = 120, GATE_DEFAULT_OUT = -50, GATE_TONE_RANGE = 120;
 static const int TONE_RANGE = 240, TONE_SAVED_ZERO = 120, TONE_PAD_RANGE = 100;
@@ -279,6 +278,8 @@ struct Shared {
 
     std::atomic<int> preset{DEFAULT_PRESET};
     std::atomic<int> eightBass{100}, eightClarity{100}, eightEcho{100};  // 8D Audio, in percent: 100 is as designed
+    std::atomic<bool> eightMove{true};                                  // 8D Audio circling at all
+    std::atomic<int> eightSpeed{49}, eightWidth{85};                    // 0..100: how fast (49 is about 8 s a turn), how far
     std::atomic<bool> enabled{true};
     std::atomic<int>  echoOn{7};
     std::atomic<int>  changeOn{1};
@@ -1406,12 +1407,18 @@ static void audioThread() {
                     const float gDrive = drive.gain();
                     for (UINT32 i = 0; i < frames; ++i) mono[i] = voiceBass.run(mono[i] * gDrive);
 
-                    // 8D Audio has no amount: the sound always circles, and its Echo sets the room's send.
+                    // 8D Audio brings its own hall, so the room's send stays shut; and it goes on your voice, sound
+                    // clips and the program alike, whatever Echo on says (its row holds 8D's motion instead).
                     const bool eight = curPreset == EIGHT_D_INDEX;
-                    const int amt = eight ? (int)std::lround(EIGHT_ECHO_AMOUNT * g.eightEcho.load() / 100.0) : curAmount;
-                    const int echoTo = g.echoOn.load();
+                    const int amt = eight ? 0 : curAmount;
+                    const int echoTo = eight ? ON_ALL : g.echoOn.load();
                     const bool fxAll = !g.enabled.load() || (!eight && amt <= 0);
-                    for (spatial::EightD* e : {&eightVoice, &eightClip, &eightApp}) e->tone(g.eightBass.load(), g.eightClarity.load());
+                    {
+                        spatial::EightSettings es;
+                        es.bass = g.eightBass.load(); es.clarity = g.eightClarity.load(); es.echo = g.eightEcho.load();
+                        es.move = g.eightMove.load(); es.speed = g.eightSpeed.load(); es.width = g.eightWidth.load();
+                        for (spatial::EightD* e : {&eightVoice, &eightClip, &eightApp}) e->apply(es);
+                    }
                     const bool effectOff = fxAll || !(echoTo & ON_VOICE);
                     const bool appFxOff = fxAll || !(echoTo & ON_PROGRAM);
                     const bool clipFxOff = fxAll || !(echoTo & ON_CLIP);
@@ -1567,7 +1574,7 @@ static void audioThread() {
                             // Plugins on the program: its own sound, before its level and the room.
                             if (gPlugProg.live()) gPlugProg.process(aL.data(), aR.data(), (int)frames);
                         } else { std::fill(aL.begin(), aL.end(), 0.0f); std::fill(aR.begin(), aR.end(), 0.0f); }
-                        // 8D Audio on the sound clip and the program, as Echo on picks them: before their level and room.
+                        // 8D Audio on the sound clip and the program, before their level: the mic gets it too.
                         if (eight && !clipFxOff) eightClip.process(cL.data(), cR.data(), (int)frames);
                         if (eight && !appFxOff && appTapOn) eightApp.process(aL.data(), aR.data(), (int)frames);
                         for (auto* b : {&mxL, &mxR, &meL, &meR, &moL, &moR, &mcL, &mcR}) b->assign(frames, 0.0f);
@@ -2492,15 +2499,28 @@ enum { ID_MIC = 101, ID_SPK, ID_PRESET };
 
 static const RECT R_SLIDER = {332, 212, 536, 234};
 static const RECT R_MIC    = {332, 288, 536, 310};
-// 8D Audio's Bass, Clarity and Echo take the place of Effects amount.
-static const RECT R_EIGHT[3] = {{384, 186, 492, 208}, {384, 210, 492, 232}, {384, 234, 492, 256}};
-static const wchar_t* const EIGHT_NAMES[3] = {L"Bass", L"Clarity", L"Echo"};
+// 8D Audio's Bass, Clarity and Echo take the place of Effects amount; its motion (Move, Speed, Width) the Echo on row.
+static const int EIGHT_KNOBS = 5;
+static const RECT R_EIGHT[EIGHT_KNOBS] = {{384, 186, 492, 208}, {384, 210, 492, 232}, {384, 234, 492, 256},
+                                          {240, TITLE_H + 412, 330, TITLE_H + 434}, {428, TITLE_H + 412, 500, TITLE_H + 434}};
+static const RECT R_EIGHT_MOVE = {110, TITLE_H + 416, 182, TITLE_H + 431};
+static const wchar_t* const EIGHT_NAMES[EIGHT_KNOBS] = {L"Bass", L"Clarity", L"Echo", L"Speed", L"Width"};
+static const int EIGHT_DEFAULTS[EIGHT_KNOBS] = {100, 100, 100, 49, 85};
 static int dragEight = -1;
 static bool eightShown() { return g.preset.load() == EIGHT_D_INDEX; }
-static std::atomic<int>& eightValue(int k) { return k == 0 ? g.eightBass : (k == 1 ? g.eightClarity : g.eightEcho); }
+static int eightMax(int k) { return k < 3 ? EIGHT_MAX : 100; }
+static std::atomic<int>& eightValue(int k) {
+    switch (k) {
+    case 0: return g.eightBass;
+    case 1: return g.eightClarity;
+    case 2: return g.eightEcho;
+    case 3: return g.eightSpeed;
+    default: return g.eightWidth;
+    }
+}
 static int eightAt(POINT p) {
     if (!eightShown()) return -1;
-    for (int k = 0; k < 3; ++k) {
+    for (int k = 0; k < EIGHT_KNOBS; ++k) {
         const RECT grab = {R_EIGHT[k].left - 8, R_EIGHT[k].top - 1, R_EIGHT[k].right + 8, R_EIGHT[k].bottom + 1};
         if (PtInRect(&grab, p)) return k;
     }
@@ -3033,7 +3053,7 @@ static bool posGlide = false;
 
 enum Knob {
     K_AMOUNT, K_MIC, K_ISO, K_CLIP_VOL, K_CLIP_POS, K_CLIP_SPEED, K_APP, K_PITCH, K_SIZE, K_VOICE, K_VSPEED, K_EIGHT,
-    K_EQ = K_EIGHT + 3, K_EQ_LEVEL = K_EQ + eqb::EQ_BANDS, K_LOOK, K_COUNT = K_LOOK + 5
+    K_EQ = K_EIGHT + 5, K_EQ_LEVEL = K_EQ + eqb::EQ_BANDS, K_LOOK, K_COUNT = K_LOOK + 5
 };
 static const UINT GLIDE_TIMER = 3;
 static const int GLIDE_MS = 260;
@@ -6016,6 +6036,7 @@ static bool settingsFileSave(const std::wstring& path) {
     fprintf(f, "mic=%s\nspk=%s\n", mic.c_str(), spk.c_str());
     fprintf(f, "preset=%d\namount=%d\nmic_level=%d\n", g.preset.load(), g.amount.load(), g.micLevel.load());
     fprintf(f, "eight_bass=%d\neight_clarity=%d\neight_echo=%d\n", g.eightBass.load(), g.eightClarity.load(), g.eightEcho.load());
+    fprintf(f, "eight_move=%d\neight_speed=%d\neight_width=%d\n", g.eightMove.load() ? 1 : 0, g.eightSpeed.load(), g.eightWidth.load());
     fprintf(f, "effects=%d\necho_on=%d\nmask_on=%d\nmonitor=%d\nwide=%d\nraw=%d\ncmss=%d\ncard_mic=%d\n", g.enabled.load() ? 1 : 0, g.echoOn.load(), g.changeOn.load(), g.monitor.load() ? 1 : 0,
             g.wide.load() ? 1 : 0, g.rawMic.load() ? 1 : 0, g.cmss.load() ? 1 : 0, g.cardMic.load() ? 1 : 0);
     fprintf(f, "isolate=%d\niso_mode=%d\niso_level=%d\n", g.isolate.load() ? 1 : 0, g.isoMode.load(), g.isoLevel.load());
@@ -6080,6 +6101,9 @@ static void settingsFileLoad(const std::wstring& path) {
         else if (k == "eight_bass")    g.eightBass = clampi(iv, 0, EIGHT_MAX);
         else if (k == "eight_clarity") g.eightClarity = clampi(iv, 0, EIGHT_MAX);
         else if (k == "eight_echo")    g.eightEcho = clampi(iv, 0, EIGHT_MAX);
+        else if (k == "eight_move")    g.eightMove = iv != 0;
+        else if (k == "eight_speed")   g.eightSpeed = clampi(iv, 0, 100);
+        else if (k == "eight_width")   g.eightWidth = clampi(iv, 0, 100);
         else if (k == "mic_level") g.micLevel = clampi(iv, 0, MIC_MAX);
         else if (k == "effects")   g.enabled = iv != 0;
         else if (k == "fx_route")  g.echoOn = echoFromRoute(clampi(iv, 0, 2));
@@ -11631,7 +11655,7 @@ static std::shared_ptr<const clip::Sound> takeRender(double from, double to) {
 
 struct TakeFxSet {
     int preset = 0, amount = 0, pitchHz = 0, ratio = 1000, mask = -1, eqLevel = 0, speed = 100;
-    int eightBass = 100, eightClarity = 100;
+    spatial::EightSettings eightSet;
     bool echo = false, masks = false, keepPitch = true, measured = false, eqOn = false, cmss = false, eight = false;
     double bassDb = 0.0;
     int eq[eqb::EQ_BANDS] = {};
@@ -11666,10 +11690,10 @@ static TakeFxSet takeFxNow() {
     TakeFxSet s;
     s.preset = std::max(0, std::min(NUM_CARD_PRESETS - 1, g.preset.load()));
     s.eight = s.preset == EIGHT_D_INDEX;
-    s.amount = s.eight ? (int)std::lround(EIGHT_ECHO_AMOUNT * g.eightEcho.load() / 100.0) : g.amount.load();
-    s.echo = g.enabled.load() && (s.eight || s.amount > 0) && (g.echoOn.load() & ON_CLIP);
-    s.eightBass = g.eightBass.load();
-    s.eightClarity = g.eightClarity.load();
+    s.amount = s.eight ? 0 : g.amount.load();
+    s.echo = g.enabled.load() && (s.eight || (s.amount > 0 && (g.echoOn.load() & ON_CLIP)));
+    s.eightSet.bass = g.eightBass.load(); s.eightSet.clarity = g.eightClarity.load(); s.eightSet.echo = g.eightEcho.load();
+    s.eightSet.move = g.eightMove.load(); s.eightSet.speed = g.eightSpeed.load(); s.eightSet.width = g.eightWidth.load();
     s.masks = (g.changeOn.load() & ON_CLIP) != 0;
     s.pitchHz = g.pitchHz.load();
     s.ratio = g.voiceRatio.load();
@@ -11725,10 +11749,11 @@ static std::shared_ptr<clip::Sound> takeFxRender(const clip::Sound& in, const Ta
     chain.eq.set(s.eq, s.eqLevel);
     spatial::EightD eight;
     eight.init(FS);
-    eight.tone(s.eightBass, s.eightClarity);
+    eight.apply(s.eightSet);
 
     const size_t n = in.frames(), body = s.speed == 100 ? n : (size_t)std::ceil(n * 100.0 / s.speed);
-    const double ring = amt <= 0 ? 0.0 : std::min(8.0, coreOn ? HC_CORE.decayTime : CARD_PRESETS[s.preset].p.decayTime);
+    const double ring = s.eight ? (s.echo && s.eightSet.echo > 0 ? 6.0 : 0.0)  // 8D's own hall
+                      : amt <= 0 ? 0.0 : std::min(8.0, coreOn ? HC_CORE.decayTime : CARD_PRESETS[s.preset].p.decayTime);
     const size_t total = body + (size_t)(ring * FS), BLOCK = 480;
     size_t readAt = 0;
     auto pull = [&](float* l, float* r, int k) {
@@ -12422,7 +12447,7 @@ static void drawRoom(HDC dc) {
             const RECT& r = R_EIGHT[k];
             const int val = eightValue(k).load();
             label(dc, 332, r.top + 4, EIGHT_NAMES[k], C_GOLD, fntBold);
-            drawFader(dc, r, val, EIGHT_MAX);
+            drawFader(dc, r, val, eightMax(k));
             swprintf_s(v, 64, L"%d%%", val);
             label(dc, r.right + 8, r.top + 4, v, C_TEXT, fntBold);
         }
@@ -12469,11 +12494,27 @@ static void drawRoom(HDC dc) {
         LineTo(dc, COL_W - 24, ECHO_Y - 8);
         SelectObject(dc, osp2);
         DeleteObject(sp2);
-        const int eo = g.echoOn.load();
-        label(dc, 24, ECHO_Y - 1, L"Echo on", C_GOLD, fntBold);
-        drawCheck(dc, R_ECHO_VOICE.left, ECHO_Y, (eo & ON_VOICE) != 0, ICO_PERSON, L"My voice");
-        drawCheck(dc, R_ECHO_CLIP.left, ECHO_Y, (eo & ON_CLIP) != 0, ICO_NOTE, L"Sound clip");
-        drawCheck(dc, R_ECHO_APP.left, ECHO_Y, (eo & ON_PROGRAM) != 0, ICO_WINDOW, L"Program");
+        if (eightShown()) {
+            // 8D goes on everything, so this row holds its motion: round and round or still, how fast, how far.
+            label(dc, 24, ECHO_Y - 1, L"Motion", C_GOLD, fntBold);
+            const bool moving = g.eightMove.load();
+            drawCheck(dc, R_EIGHT_MOVE.left, ECHO_Y, moving, ICO_LOOP, L"Move");
+            const COLORREF tx = moving ? C_TEXT : C_DIM;
+            label(dc, R_EIGHT[3].left - 44, ECHO_Y - 1, L"Speed", moving ? C_GOLD : C_DIM, fntBold);
+            drawFader(dc, R_EIGHT[3], g.eightSpeed.load(), 100);
+            swprintf_s(v, 64, L"%.1f s", spatial::EightD::turnSeconds(g.eightSpeed.load()));
+            label(dc, R_EIGHT[3].right + 8, ECHO_Y - 1, v, tx, fntBold);
+            label(dc, R_EIGHT[4].left - 44, ECHO_Y - 1, L"Width", moving ? C_GOLD : C_DIM, fntBold);
+            drawFader(dc, R_EIGHT[4], g.eightWidth.load(), 100);
+            swprintf_s(v, 64, L"%d%%", g.eightWidth.load());
+            label(dc, R_EIGHT[4].right + 8, ECHO_Y - 1, v, tx, fntBold);
+        } else {
+            const int eo = g.echoOn.load();
+            label(dc, 24, ECHO_Y - 1, L"Echo on", C_GOLD, fntBold);
+            drawCheck(dc, R_ECHO_VOICE.left, ECHO_Y, (eo & ON_VOICE) != 0, ICO_PERSON, L"My voice");
+            drawCheck(dc, R_ECHO_CLIP.left, ECHO_Y, (eo & ON_CLIP) != 0, ICO_NOTE, L"Sound clip");
+            drawCheck(dc, R_ECHO_APP.left, ECHO_Y, (eo & ON_PROGRAM) != 0, ICO_WINDOW, L"Program");
+        }
     }
 }
 
@@ -12648,7 +12689,7 @@ static void setAmountFromX(HWND hwnd, int x) {
 }
 
 static void setEightFromX(HWND hwnd, int k, int x) {
-    eightValue(k) = faderValue(R_EIGHT[k], x, EIGHT_MAX);
+    eightValue(k) = faderValue(R_EIGHT[k], x, eightMax(k));
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -12710,7 +12751,7 @@ static void setPosFromX(HWND hwnd, int x) {
 
 static int knobValue(int k) {
     if (k >= K_LOOK) return lookFaderValue(k - K_LOOK);
-    if (k >= K_EIGHT && k < K_EIGHT + 3) return eightValue(k - K_EIGHT).load();
+    if (k >= K_EIGHT && k < K_EIGHT + EIGHT_KNOBS) return eightValue(k - K_EIGHT).load();
     if (k >= K_EQ && k < K_EQ_LEVEL) return g.eqDb[k - K_EQ].load();
     switch (k) {
     case K_AMOUNT: return g.amount.load();
@@ -12737,7 +12778,7 @@ static int knobDefault(int k) {
         static const int LOOK_DEFAULTS[5] = {PURPLE_THEME.depth, CLEAR_DEFAULT, BLUR_DEFAULT, DARKEN_DEFAULT, 100};
         return LOOK_DEFAULTS[k - K_LOOK];
     }
-    if (k >= K_EIGHT && k < K_EIGHT + 3) return 100;
+    if (k >= K_EIGHT && k < K_EIGHT + EIGHT_KNOBS) return EIGHT_DEFAULTS[k - K_EIGHT];
     if (k >= K_EQ && k < K_EQ_LEVEL) {
         const int* b = eqPresetBands(g.eqPreset.load());
         return b ? b[k - K_EQ] : 0;
@@ -12763,7 +12804,7 @@ static void knobSet(int k, int v) {
         if (hLook) setLookValue(hLook, k - K_LOOK, v);
         return;
     }
-    if (k >= K_EIGHT && k < K_EIGHT + 3) {
+    if (k >= K_EIGHT && k < K_EIGHT + EIGHT_KNOBS) {
         eightValue(k - K_EIGHT) = v;
         return;
     }
@@ -13066,8 +13107,11 @@ static const wchar_t* tipText(UINT_PTR id, UINT flags) {
     const bool eightRow = r == &R_EIGHT[0] || r == &R_EIGHT[2];
     if (eightRow && !eightShown()) return L"";
     if (eightRow || (r == &R_SLIDER && eightShown()))
-        return L"8D Audio: the sound circles your head. Bass lifts the low end, Clarity the detail and the voices, "
-               L"Echo the hall around it. 100% is as designed; Echo on picks what goes round.";
+        return L"8D Audio: your voice, sound clips and the program circle your head. Bass lifts the low end, Clarity "
+               L"the detail and the voices, Echo the hall around it. 100% is as designed.";
+    if (eightShown() && (r == &R_ECHO_VOICE || r == &R_ECHO_CLIP || r == &R_ECHO_APP))
+        return L"8D motion. Move turns the circling on or off (off, the sound stays in front of you). Speed is the time "
+               L"for one turn, Width how far to each side it goes.";
     static std::wstring joined;
     joined = HINTS[i].text;
     if ((HINTS[i].r == &R_APP_CARD || HINTS[i].r == &R_APP_SELF) && gApp.chosen()) joined += std::wstring(L" ") + appRouteNote();
@@ -14324,6 +14368,7 @@ static std::vector<ValueSpot> valueSpots() {
         static const wchar_t* const SPOT_NAMES[3] = {L"Bass (%)", L"Clarity (%)", L"Echo (%)"};
         v.erase(std::remove_if(v.begin(), v.end(), [](const ValueSpot& s) { return s.knob == K_AMOUNT; }), v.end());
         for (int k = 0; k < 3; ++k) v.push_back({K_EIGHT + k, after(R_EIGHT[k], 8, R_EIGHT[k].top + 4, 44), SPOT_NAMES[k], 0, EIGHT_MAX, 0});
+        v.push_back({K_EIGHT + 4, after(R_EIGHT[4], 8, R_EIGHT[4].top + 4, 44), L"Width (%)", 0, 100, 0});
     }
     for (int k = 0; k < eqb::EQ_BANDS; ++k) {
         const int x = eqFaderX(k);
@@ -14839,8 +14884,14 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
+        if (eightShown() && PtInRect(&R_EIGHT_MOVE, p)) {
+            g.eightMove = !g.eightMove.load();
+            settingsSave();
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         {
-            const int bit = PtInRect(&R_ECHO_VOICE, p) ? ON_VOICE : PtInRect(&R_ECHO_CLIP, p) ? ON_CLIP
+            const int bit = eightShown() ? 0 : PtInRect(&R_ECHO_VOICE, p) ? ON_VOICE : PtInRect(&R_ECHO_CLIP, p) ? ON_CLIP
                           : PtInRect(&R_ECHO_APP, p) ? ON_PROGRAM : 0;
             if (bit) {
                 g.echoOn = g.echoOn.load() ^ bit;
@@ -15287,7 +15338,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         RECT roomArea = {12, TITLE_H + 146, COL_W - 12, TITLE_H + 444};
-        if (const int e = eightAt(pt); e >= 0) wheelKnob(h, K_EIGHT + e, std::max(0, std::min(EIGHT_MAX, knobAim(K_EIGHT + e) + d * 5)));
+        if (const int e = eightAt(pt); e >= 0) wheelKnob(h, K_EIGHT + e, std::max(0, std::min(eightMax(e), knobAim(K_EIGHT + e) + d * (e < 3 ? 5 : 2))));
         else if (PtInRect(&roomArea, pt) && !eightShown()) wheelKnob(h, K_AMOUNT, std::max(0, std::min(100, knobAim(K_AMOUNT) + d)));
         return 0;
     }
