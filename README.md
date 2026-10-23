@@ -28,6 +28,7 @@
   - **Solo** و **Mute**.
 - **الساوندبورد:** 12 Pad، ولكل واحد مفتاح يشغّله حتى وأنت داخل لعبة. اسحب الأصوات وأفلتها على الـ Pads، أو اسحب ملفات من سطح المكتب مباشرة.
 - **المسجّل:** يحتفظ بآخر دقائق من صوتك.
+- **الإضافات (Plugins):** حط إضافات VST2 (مثل إضافات Kilohearts kHs) على صوتك أو على برنامج تختاره، من لوحة Plugins. كليك على الإضافة يفتح نافذتها، وكليك يمين يعطيك خياراتها (إيقاف، ترتيب، حذف). Pixl يدوّر عليها في مجلدات VST المعروفة ومجلد تختاره، وإعداداتها تنحفظ.
 
 ### التحميل والتثبيت
 
@@ -92,6 +93,7 @@
   - **Solo** and **Mute**.
 - **Soundboard:** 12 pads, each with a key that plays it even inside a game. Drag sounds onto pads, or drop sound files straight from Explorer.
 - **Recorder:** keeps the last few minutes of your voice.
+- **Plugins:** put VST2 effects (Kilohearts' kHs ones, for example) on your voice or on a program you pick, from the Plugins panel. Click an effect to open its window; right-click it to turn it off, move it or remove it. Pixl finds them in the usual VST folders and a folder you choose, and keeps their settings. VST is a trademark of Steinberg Media Technologies GmbH.
 
 ### Download and install
 

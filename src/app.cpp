@@ -89,10 +89,14 @@ using std::max; using std::min;
 #include "voice/voice_shaper.hpp"
 #include "voice/voice_tone.hpp"
 #include "voice/voice_color.hpp"
+#include "plugins/plugin_chain.hpp"
+#include "plugins/plugin_scan.hpp"
 using namespace mix;
 
 static clip::Player gClip;
 static clip::ProgramTap gApp;
+// Plugins (VST2 effects, Kilohearts' kHs among them) on your voice and on the program: the audio thread runs them.
+static plugins::Chain gPlugVoice, gPlugProg;
 static mixer::Mixer gMix;
 static clip::SoundBoard gBoard;
 static clip::Recorder gRec, gRecHear, gBackVoice, gBackHear;
@@ -1018,7 +1022,7 @@ static void audioThread() {
     eax::EAXReverb* rv = buildEngine(curPreset);
     eax::EAXReverb* rvLoud = nullptr;
 
-    std::vector<float> mono, send, wl, wr, dl, dr, kl, kr, inter, heard, micIn;
+    std::vector<float> mono, send, wl, wr, dl, dr, kl, kr, inter, heard, micIn, plugL, plugR;
     MicDrive drive;
     float dryNow = 1.0f;
     StepBack voiceBack;
@@ -1491,6 +1495,16 @@ static void audioThread() {
                         inter[2 * i] = cl;
                         inter[2 * i + 1] = cr;
                     }
+                    // Plugins on the voice: after Pixl's own sound, once, and you hear what the mic sends.
+                    if (gPlugVoice.live()) {
+                        plugL.resize(frames); plugR.resize(frames);
+                        for (UINT32 i = 0; i < frames; ++i) { plugL[i] = inter[2 * i]; plugR[i] = inter[2 * i + 1]; }
+                        gPlugVoice.process(plugL.data(), plugR.data(), (int)frames);
+                        for (UINT32 i = 0; i < frames; ++i) {
+                            inter[2 * i] = heard[2 * i] = plugL[i];
+                            inter[2 * i + 1] = heard[2 * i + 1] = plugR[i];
+                        }
+                    }
                     gRec.feed(inter.data(), frames);
                     gBackVoice.feed(inter.data(), frames);
 
@@ -1519,8 +1533,11 @@ static void audioThread() {
                                             [](float* l, float* r, int n) { gClip.pull(l, r, n); });
                         }
                         gBoard.mix(cL.data(), cR.data(), (int)frames);
-                        if (appTapOn) gApp.pull(aL.data(), aR.data(), (int)frames);
-                        else { std::fill(aL.begin(), aL.end(), 0.0f); std::fill(aR.begin(), aR.end(), 0.0f); }
+                        if (appTapOn) {
+                            gApp.pull(aL.data(), aR.data(), (int)frames);
+                            // Plugins on the program: its own sound, before its level and the room.
+                            if (gPlugProg.live()) gPlugProg.process(aL.data(), aR.data(), (int)frames);
+                        } else { std::fill(aL.begin(), aL.end(), 0.0f); std::fill(aR.begin(), aR.end(), 0.0f); }
                         for (auto* b : {&mxL, &mxR, &meL, &meR, &moL, &moR, &mcL, &mcR}) b->assign(frames, 0.0f);
                         if (mixOn) gMix.pull(mxL.data(), mxR.data(), meL.data(), meR.data(), moL.data(), moR.data(), mcL.data(), mcR.data(), (int)frames);
                         const float cg = micGainFor(g.clipGain.load());
@@ -5080,6 +5097,53 @@ static const RECT R_APP_VOL   = {CX + 96,  CLIP_Y + 222, CX + 300, CLIP_Y + 244}
 static const RECT R_APP_ONLY  = {CX + 358, CLIP_Y + 226, CX + 542, CLIP_Y + 241};
 static const RECT R_APP_CARD  = {CX + 24,  CLIP_Y + 274, CX + 236, CLIP_Y + 289};
 static const RECT R_APP_SELF  = {CX + 300, CLIP_Y + 274, CX + 542, CLIP_Y + 289};
+
+// Plugins panel (where "Program on the mic" was): two tabs, your voice and the program, each with its row of effects.
+// The program tab keeps the program's own controls (the box, its level, who hears it) above its effects.
+enum { PLUG_VOICE, PLUG_PROGRAM };
+static int plugTab = PLUG_VOICE;
+static const RECT R_PLUG_TAB_VOICE = {CX + 318, CLIP_Y + 164, CX + 428, CLIP_Y + 186};
+static const RECT R_PLUG_TAB_PROG  = {CX + 432, CLIP_Y + 164, CX + COL_W - 24, CLIP_Y + 186};
+static const RECT R_PLUG_ON     = {CX + 96, CLIP_Y + 232, CX + 300, CLIP_Y + 247};
+static const RECT R_PLUG_FOLDER = {CX + COL_W - 24 - 150, CLIP_Y + 262, CX + COL_W - 24, CLIP_Y + 286};
+static const int PLUG_MAX = plugins::Chain::kMaxSlots;
+// The effect buttons and "+ Add" after them (the last one), laid out by plugLayout() for the open tab.
+static RECT rPlugPill[PLUG_MAX + 1] = {};
+static int plugPills = 0;
+static bool plugAddShown = false;
+static std::wstring plugFolder;          // the user's own plugin folder, searched with the usual ones
+static std::vector<plugins::Found> plugFound;
+static std::wstring plugNote;            // what went wrong last (a plugin that would not load)
+
+static plugins::Chain& plugChain(int tab) { return tab == PLUG_PROGRAM ? gPlugProg : gPlugVoice; }
+
+// "kHs Reverb" reads "Reverb" on its button: the panel is narrow and every Kilohearts effect would start the same.
+static std::wstring plugShort(const std::wstring& name) {
+    return name.rfind(L"kHs ", 0) == 0 ? name.substr(4) : name;
+}
+
+static void plugLayout() {
+    plugins::Chain& c = plugChain(plugTab);
+    const int top = plugTab == PLUG_PROGRAM ? CLIP_Y + 249 : CLIP_Y + 196, bottom = top + (plugTab == PLUG_PROGRAM ? 21 : 22);
+    const int left = CX + 96, right = CX + COL_W - 24, gap = 6, addW = 70;
+    plugPills = c.size();
+    plugAddShown = plugPills < PLUG_MAX;
+    const int room = right - left - (plugAddShown ? addW + gap : 0);
+    const int each = plugPills ? std::min(118, (room - gap * (plugPills - 1)) / plugPills) : 0;
+    int x = left;
+    for (int i = 0; i < plugPills; ++i) {
+        rPlugPill[i] = {x, top, x + each, bottom};
+        x += each + gap;
+    }
+    for (int i = plugPills; i < PLUG_MAX; ++i) rPlugPill[i] = {0, 0, 0, 0};
+    rPlugPill[PLUG_MAX] = plugAddShown ? RECT{x, top, x + addW, bottom} : RECT{0, 0, 0, 0};
+}
+
+static int plugPillAt(POINT p) {
+    plugLayout();
+    for (int i = 0; i < plugPills; ++i) if (PtInRect(&rPlugPill[i], p)) return i;
+    return -1;
+}
 static const wchar_t* EQ_BAND_NAME[eqb::EQ_BANDS] =
     {L"125", L"250", L"500", L"1k", L"2k", L"4k", L"8k"};
 static int dragEq = -1;
@@ -5453,48 +5517,67 @@ static void drawEqPanel(HDC dc) {
             SelectObject(dc, op);
             DeleteObject(dp);
         }
-        label(dc, CX + 24, CLIP_Y + 168, L"Program on the mic", C_GOLD, fntBold);
+        label(dc, CX + 24, CLIP_Y + 168, L"Plugins", C_GOLD, fntBold);
+        iconButton(dc, R_PLUG_TAB_VOICE, ICO_MIC, L"My voice", isHot(R_PLUG_TAB_VOICE), true, plugTab == PLUG_VOICE);
+        iconButton(dc, R_PLUG_TAB_PROG, ICO_WINDOW, L"Program", isHot(R_PLUG_TAB_PROG), true, plugTab == PLUG_PROGRAM);
         {
-            std::wstring note = appNote.empty() ? std::wstring(L"Pick an app to play through your mic") : appNote;
-            COLORREF shade = appNote.empty() ? C_DIM : C_GOLD;
-            if (gApp.active()) {
-                const bool heard = gApp.heard();
-                note = !heard ? L"Waiting for " + gApp.name + L" to play sound" : g.appOnly.load() ? L"Only you hear " + gApp.name : gApp.name + L" is on your mic";
-                shade = heard ? C_TEXT : C_DIM;
-            } else if (gApp.chosen()) {
-                note = L"Opening " + gApp.name + L"...";
-                shade = C_DIM;
+            // The line beside the title: what went wrong, else what the open tab is doing.
+            std::wstring note = plugNote;
+            COLORREF shade = C_GOLD;
+            if (note.empty() && plugTab == PLUG_PROGRAM) {
+                note = appNote;
+                if (gApp.active()) {
+                    const bool heard = gApp.heard();
+                    note = !heard ? L"Waiting for " + gApp.name : g.appOnly.load() ? L"Only you hear " + gApp.name : gApp.name + L" is on your mic";
+                    shade = heard ? C_TEXT : C_DIM;
+                } else if (gApp.chosen()) {
+                    note = L"Opening " + gApp.name + L"...";
+                    shade = C_DIM;
+                }
             }
-            RECT nr = {CX + 170, CLIP_Y + 167, CX + COL_W - 24, CLIP_Y + 184};
-            SetTextColor(dc, shade);
-            SetBkMode(dc, TRANSPARENT);
-            HGDIOBJ of = SelectObject(dc, fntUI);
-            drawText(dc, note.c_str(), -1, &nr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(dc, of);
+            if (!note.empty()) {
+                RECT nr = {CX + 96, CLIP_Y + 167, R_PLUG_TAB_VOICE.left - 10, CLIP_Y + 184};
+                SetTextColor(dc, shade);
+                SetBkMode(dc, TRANSPARENT);
+                HGDIOBJ of = SelectObject(dc, fntUI);
+                drawText(dc, note.c_str(), -1, &nr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                SelectObject(dc, of);
+            }
         }
-        label(dc, CX + 24, R_APP_BOX.top + 4, L"Program", C_DIM, fntUI);
-        label(dc, CX + 24, R_APP_VOL.top + 3, L"Level", C_DIM, fntUI);
-        drawFader(dc, R_APP_VOL, g.appGain.load(), APP_MAX);
-        {
-            const int span = R_APP_VOL.right - R_APP_VOL.left - 12;
-            levelTick(dc, R_APP_VOL, APP_MAX);
-            SetBkMode(dc, TRANSPARENT);
-            HGDIOBJ of = SelectObject(dc, fntUI);
-            for (int mark : {100, 500, APP_MAX}) {
-                const int mx = R_APP_VOL.left + 6 + span * mark / APP_MAX;
-                wchar_t mt[8];
-                swprintf_s(mt, 8, L"%d", mark);
-                RECT mr = {mx - 30, R_APP_VOL.bottom + 8, mx + 30, R_APP_VOL.bottom + 24};
-                SetTextColor(dc, mark == 100 ? C_GOLD : C_DIM);
-                drawText(dc, mt, -1, &mr, DT_CENTER | DT_TOP | DT_SINGLELINE);
-            }
-            SelectObject(dc, of);
+        plugins::Chain& chain = plugChain(plugTab);
+        plugLayout();
+        if (plugTab == PLUG_PROGRAM) {
+            label(dc, CX + 24, R_APP_BOX.top + 4, L"Program", C_DIM, fntUI);
+            label(dc, CX + 24, R_APP_VOL.top + 3, L"Level", C_DIM, fntUI);
+            drawFader(dc, R_APP_VOL, g.appGain.load(), APP_MAX);  // no ticks: the effects row sits right under it
             swprintf_s(cv, 16, L"%d", g.appGain.load());
             label(dc, R_APP_VOL.right + 10, R_APP_VOL.top + 3, cv, gApp.active() ? C_TEXT : C_DIM, fntBold);
+            drawCheck(dc, R_APP_ONLY.left, R_APP_ONLY.top, g.appOnly.load(), ICO_LOCK, L"Only I hear it");
+            drawRadio(dc, R_APP_CARD.left, R_APP_CARD.top,  g.appHear.load(), ICO_CHIP, L"Hear it through the card");
+            drawRadio(dc, R_APP_SELF.left, R_APP_SELF.top, !g.appHear.load(), ICO_WINDOW, L"Hear it from the app");
+        } else {
+            drawCheck(dc, R_PLUG_ON.left, R_PLUG_ON.top, chain.on.load(), L"Effects on");
+            label(dc, R_PLUG_ON.right + 8, R_PLUG_ON.top - 1, chain.size() ? L"Right-click an effect for more" : L"", C_DIM, fntUI);
+            iconButton(dc, R_PLUG_FOLDER, ICO_OPEN, L"Plugin folder", isHot(R_PLUG_FOLDER));
+            std::wstring where = plugFolder.empty() ? std::wstring(L"Searched in the usual VST folders") : L"Also searched: " + plugFolder;
+            RECT wr = {CX + 24, R_PLUG_FOLDER.top, R_PLUG_FOLDER.left - 10, R_PLUG_FOLDER.bottom};
+            SetTextColor(dc, C_DIM);
+            SetBkMode(dc, TRANSPARENT);
+            HGDIOBJ of = SelectObject(dc, fntUI);
+            drawText(dc, where.c_str(), -1, &wr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+            SelectObject(dc, of);
         }
-        drawCheck(dc, R_APP_ONLY.left, R_APP_ONLY.top, g.appOnly.load(), ICO_LOCK, L"Only I hear it");
-        drawRadio(dc, R_APP_CARD.left, R_APP_CARD.top,  g.appHear.load(), ICO_CHIP, L"Hear it through the card");
-        drawRadio(dc, R_APP_SELF.left, R_APP_SELF.top, !g.appHear.load(), ICO_WINDOW, L"Hear it from the app");
+        label(dc, CX + 24, (plugTab == PLUG_PROGRAM ? CLIP_Y + 249 : CLIP_Y + 196) + 3, L"Effects", C_DIM, fntUI);
+        for (int i = 0; i < plugPills; ++i) {
+            vst2::Plugin* p = chain.at(i);
+            if (!p) continue;
+            const std::wstring name = plugShort(p->title());
+            if (chain.bypassed(i) || p->crashed())
+                buttonFace(dc, rPlugPill[i], ICO_NONE, name.c_str(), C_PANEL, C_EDGE, C_DIM);
+            else
+                iconButton(dc, rPlugPill[i], ICO_NONE, name.c_str(), isHot(rPlugPill[i]), true, p->editorOpen());
+        }
+        if (plugAddShown) iconButton(dc, rPlugPill[PLUG_MAX], ICO_NONE, L"+ Add", isHot(rPlugPill[PLUG_MAX]));
     }
 }
 
@@ -10288,6 +10371,326 @@ static void mixAddProgram(HWND h, int i) {
     SetForegroundWindow(hPick);
 }
 
+// ---------------------------------------------------------------- a small list in Pixl's look (plugins, an effect's options)
+static const int MENU_W = 260, MENU_ROW = 26, MENU_ROWS = 14;
+static HWND hMenuList = nullptr;
+static std::vector<std::wstring> menuItems;
+static std::function<void(int)> menuPicked;
+static int menuHot = -1, menuTop = 0;
+static bool menuMouse = false;
+
+static int menuShown() { return std::max(1, std::min(MENU_ROWS, (int)menuItems.size())); }
+static int menuH() { return 8 + menuShown() * MENU_ROW; }
+static RECT menuRowRect(int k) { const int y = 4 + (k - menuTop) * MENU_ROW; return {4, y, MENU_W - 4, y + MENU_ROW}; }
+
+static void paintMenuList(HDC dc, const RECT& rc) {
+    HBRUSH bg = CreateSolidBrush(C_BACK);
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    panel(dc, RECT{0, 0, MENU_W, menuH()}, C_PANEL, mixc(C_EDGE, C_GOLD, 0.6));
+    const int last = std::min((int)menuItems.size(), menuTop + MENU_ROWS);
+    for (int k = menuTop; k < last; ++k) {
+        const RECT r = menuRowRect(k);
+        if (k == menuHot) panel(dc, r, C_NAVY, C_GOLD);
+        mixText(dc, RECT{r.left + 10, r.top, r.right - 8, r.bottom}, menuItems[k].c_str(), k == menuHot ? C_GOLD : C_TEXT, fntUI);
+    }
+    if ((int)menuItems.size() > MENU_ROWS) {
+        const int trackH = menuH() - 8, n = (int)menuItems.size();
+        const int thumbH = std::max(16, trackH * MENU_ROWS / n);
+        const int thumbY = 4 + (trackH - thumbH) * menuTop / std::max(1, n - MENU_ROWS);
+        panel(dc, RECT{MENU_W - 6, thumbY, MENU_W - 3, thumbY + thumbH}, C_EDGE, C_EDGE);
+    }
+}
+
+static int menuAt(POINT p) {
+    if (p.x < 4 || p.x >= MENU_W - 4 || p.y < 4) return -1;
+    const int k = menuTop + (p.y - 4) / MENU_ROW;
+    return k < (int)menuItems.size() && k < menuTop + MENU_ROWS ? k : -1;
+}
+
+static LRESULT CALLBACK menuListProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PRINTCLIENT:
+        printBox(h, (HDC)w, paintMenuList);
+        return 0;
+    case WM_PAINT:
+        paintBox(h, paintMenuList);
+        return 0;
+    case WM_MOUSEMOVE: {
+        boxTrackLeave(h, menuMouse);
+        const int k = menuAt(POINT{(short)LOWORD(l), (short)HIWORD(l)});
+        if (k != menuHot) { menuHot = k; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        menuMouse = false;
+        menuHot = -1;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        const int most = std::max(0, (int)menuItems.size() - MENU_ROWS);
+        menuTop = std::max(0, std::min(most, menuTop - GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
+        menuHot = menuAt(wheelPoint(h, l));
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        const int k = menuAt(POINT{(short)LOWORD(l), (short)HIWORD(l)});
+        if (k < 0) return 0;
+        auto picked = menuPicked;
+        DestroyWindow(h);
+        // After the list is gone: the choice may open a window of its own.
+        if (picked) picked(k);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        break;
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE) { PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
+        break;
+    case WM_DESTROY:
+        hMenuList = nullptr;
+        menuMouse = false;
+        menuHot = -1;
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// Opens the list under at (design coordinates of the owner), kept on the screen; picked runs with the row chosen.
+static void showMenuList(HWND owner, const RECT& at, std::vector<std::wstring> items, std::function<void(int)> picked) {
+    if (hMenuList) DestroyWindow(hMenuList);
+    if (items.empty()) return;
+    menuItems = std::move(items);
+    menuPicked = std::move(picked);
+    menuTop = 0;
+    menuHot = -1;
+    RECT shown = at;
+    layoutOut(shown);
+    POINT pt = {sc(shown.left), sc(shown.bottom + 2)};
+    ClientToScreen(owner, &pt);
+    const RECT wa = workAreaOf(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST));
+    const int w = sc(MENU_W), ht = sc(menuH());
+    pt.x = std::max(wa.left, std::min(pt.x, wa.right - w));
+    if (pt.y + ht > wa.bottom) pt.y = std::max(wa.top, pt.y - ht - sc(at.bottom - at.top + 4));
+    hMenuList = CreateWindowExW(WS_EX_TOOLWINDOW, L"PixlMenuList", L"", WS_POPUP, pt.x, pt.y, w, ht, owner, nullptr, nullptr, nullptr);
+    if (!hMenuList) return;
+    ShowWindow(hMenuList, SW_SHOW);
+    SetForegroundWindow(hMenuList);
+}
+
+// ---------------------------------------------------------------- plugins: their windows, kept settings, the panel's actions
+static const wchar_t* PLUG_KEY = L"Software\\Pixl\\Plugins";
+
+static void plugSaveChain(HKEY k, const wchar_t* name, plugins::Chain& c) {
+    const DWORD n = (DWORD)c.size(), on = c.on.load() ? 1 : 0;
+    RegSetValueExW(k, (std::wstring(name) + L"Count").c_str(), 0, REG_DWORD, (const BYTE*)&n, sizeof n);
+    RegSetValueExW(k, (std::wstring(name) + L"On").c_str(), 0, REG_DWORD, (const BYTE*)&on, sizeof on);
+    for (int i = 0; i < c.size(); ++i) {
+        vst2::Plugin* p = c.at(i);
+        if (!p) continue;
+        const std::wstring at = std::wstring(name) + std::to_wstring(i);
+        RegSetValueExW(k, (at + L"Path").c_str(), 0, REG_SZ, (const BYTE*)p->path.c_str(), (DWORD)((p->path.size() + 1) * sizeof(wchar_t)));
+        const DWORD off = c.bypassed(i) ? 1 : 0;
+        RegSetValueExW(k, (at + L"Off").c_str(), 0, REG_DWORD, (const BYTE*)&off, sizeof off);
+        const std::vector<uint8_t> state = p->saveState();
+        RegSetValueExW(k, (at + L"State").c_str(), 0, REG_BINARY, state.empty() ? nullptr : state.data(), (DWORD)state.size());
+    }
+}
+
+// Both rows of effects with each effect's own settings, the open tab and the user's folder.
+static void plugSave() {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, PLUG_KEY, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    const DWORD tab = (DWORD)plugTab;
+    RegSetValueExW(k, L"Tab", 0, REG_DWORD, (const BYTE*)&tab, sizeof tab);
+    RegSetValueExW(k, L"Folder", 0, REG_SZ, (const BYTE*)plugFolder.c_str(), (DWORD)((plugFolder.size() + 1) * sizeof(wchar_t)));
+    plugSaveChain(k, L"Voice", gPlugVoice);
+    plugSaveChain(k, L"Program", gPlugProg);
+    RegCloseKey(k);
+}
+
+static void plugLoadChain(HKEY k, const wchar_t* name, plugins::Chain& c) {
+    auto dword = [&](const std::wstring& v, DWORD def) { DWORD x = def, sz = sizeof x; RegQueryValueExW(k, v.c_str(), nullptr, nullptr, (BYTE*)&x, &sz); return x; };
+    c.on = dword(std::wstring(name) + L"On", 1) != 0;
+    const DWORD n = std::min<DWORD>(dword(std::wstring(name) + L"Count", 0), PLUG_MAX);
+    for (DWORD i = 0; i < n; ++i) {
+        const std::wstring at = std::wstring(name) + std::to_wstring(i);
+        wchar_t path[MAX_PATH] = {};
+        DWORD sz = sizeof path;
+        if (RegQueryValueExW(k, (at + L"Path").c_str(), nullptr, nullptr, (BYTE*)path, &sz) != ERROR_SUCCESS) continue;
+        auto p = std::make_unique<vst2::Plugin>();
+        if (!p->load(path)) { plugNote = p->why(); continue; }
+        DWORD bytes = 0;
+        if (RegQueryValueExW(k, (at + L"State").c_str(), nullptr, nullptr, nullptr, &bytes) == ERROR_SUCCESS && bytes) {
+            std::vector<uint8_t> state(bytes);
+            if (RegQueryValueExW(k, (at + L"State").c_str(), nullptr, nullptr, state.data(), &bytes) == ERROR_SUCCESS) p->loadState(state);
+        }
+        c.add(std::move(p), dword(at + L"Off", 0) != 0);
+    }
+}
+
+static void plugLoad() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, PLUG_KEY, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return;
+    DWORD tab = 0, sz = sizeof tab;
+    RegQueryValueExW(k, L"Tab", nullptr, nullptr, (BYTE*)&tab, &sz);
+    plugTab = tab == PLUG_PROGRAM ? PLUG_PROGRAM : PLUG_VOICE;
+    wchar_t folder[MAX_PATH] = {};
+    sz = sizeof folder;
+    if (RegQueryValueExW(k, L"Folder", nullptr, nullptr, (BYTE*)folder, &sz) == ERROR_SUCCESS) plugFolder = folder;
+    plugLoadChain(k, L"Voice", gPlugVoice);
+    plugLoadChain(k, L"Program", gPlugProg);
+    RegCloseKey(k);
+}
+
+// A plugin's own window: its editor inside, the plugin asked to idle often (its meters and knobs move).
+static LRESULT CALLBACK plugWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    auto* p = (vst2::Plugin*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_TIMER:
+        if (p) p->editorIdle();
+        return 0;
+    case WM_CLOSE:
+        KillTimer(h, 1);
+        if (p) { p->closeEditor(); p->editorWindow = nullptr; }
+        DestroyWindow(h);
+        plugSave();  // its settings as the window leaves them
+        if (hwndMain) InvalidateRect(hwndMain, nullptr, FALSE);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void plugCloseWindow(vst2::Plugin* p) {
+    if (p && p->editorWindow) SendMessageW(p->editorWindow, WM_CLOSE, 0, 0);
+}
+
+// Opens the plugin's window beside Pixl's, or closes it when it is open.
+static void plugToggleWindow(vst2::Plugin* p) {
+    if (!p) return;
+    if (p->editorWindow) { plugCloseWindow(p); return; }
+    if (!p->hasEditor()) { plugNote = p->title() + L" has no window of its own"; return; }
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    HWND w = CreateWindowExW(0, L"PixlPlugin", (p->title() + L" - Pixl").c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
+                             hwndMain, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!w) return;
+    SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)p);
+    if (HICON ic = (HICON)SendMessageW(hwndMain, WM_GETICON, ICON_SMALL, 0)) SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)ic);
+    p->editorWindow = w;
+    int ew = 0, eh = 0;
+    p->openEditor(w, ew, eh);
+    RECT r{0, 0, ew, eh};
+    AdjustWindowRectEx(&r, style, FALSE, 0);
+    // Beside Pixl's window, on the same screen.
+    RECT mw;
+    GetWindowRect(hwndMain, &mw);
+    const RECT wa = workAreaOf(MonitorFromWindow(hwndMain, MONITOR_DEFAULTTONEAREST));
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    int x = mw.right + 8, y = mw.top + 40;
+    if (x + ww > wa.right) x = std::max((int)wa.left, (int)mw.left - ww - 8);
+    y = std::max((int)wa.top, std::min(y, (int)wa.bottom - wh));
+    SetWindowPos(w, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(w, SW_SHOW);
+    SetTimer(w, 1, 30, nullptr);
+}
+
+// A plugin chosen from the list: loaded, put at the end of the open tab's row, and its window opened to set it up.
+static void plugAdd(HWND h, const plugins::Found& f) {
+    plugins::Chain& c = plugChain(plugTab);
+    if (c.size() >= PLUG_MAX) return;
+    HCURSOR was = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    auto p = std::make_unique<vst2::Plugin>();
+    const bool ok = p->load(f.path);
+    SetCursor(was);
+    if (!ok) { plugNote = p->why(); InvalidateRect(h, nullptr, FALSE); return; }
+    plugNote.clear();
+    vst2::Plugin* raw = p.get();
+    c.add(std::move(p));
+    plugSave();
+    plugToggleWindow(raw);
+    InvalidateRect(h, nullptr, FALSE);
+}
+
+static bool plugPickFolder(HWND h) {
+    IFileOpenDialog* d = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return false;
+    DWORD o = 0;
+    d->GetOptions(&o);
+    d->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    d->SetTitle(L"Folder with your VST plugins");
+    bool picked = false;
+    if (SUCCEEDED(d->Show(h))) {
+        IShellItem* it = nullptr;
+        if (SUCCEEDED(d->GetResult(&it))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &path))) { plugFolder = path; picked = true; CoTaskMemFree(path); }
+            it->Release();
+        }
+    }
+    d->Release();
+    if (picked) { plugFound.clear(); plugSave(); }
+    return picked;
+}
+
+static void plugAddMenu(HWND h) {
+    hotLeave(h);
+    // Searched each time the list opens: a few dozen files' headers, read in an instant, so new installs show at once.
+    std::vector<std::wstring> folders = plugins::standardFolders();
+    if (!plugFolder.empty()) folders.push_back(plugFolder);
+    plugFound = plugins::scan(folders);
+    std::vector<std::wstring> items;
+    for (const auto& f : plugFound) items.push_back(f.name);
+    items.push_back(plugFound.empty() ? L"No plugins found: choose their folder..." : L"Choose another plugin folder...");
+    showMenuList(h, rPlugPill[PLUG_MAX], items, [h](int k) {
+        if (k < (int)plugFound.size()) { plugAdd(h, plugFound[k]); return; }
+        if (plugPickFolder(h)) plugAddMenu(h);
+        InvalidateRect(h, nullptr, FALSE);
+    });
+}
+
+// Right-click on an effect: its window, on or off, its place in the row, out.
+static void plugEffectMenu(HWND h, int i) {
+    hotLeave(h);
+    plugins::Chain& c = plugChain(plugTab);
+    vst2::Plugin* p = c.at(i);
+    if (!p) return;
+    std::vector<std::wstring> items = {p->editorOpen() ? L"Close its window" : L"Open its window",
+                                       c.bypassed(i) ? L"Turn on" : L"Turn off (bypass)", L"Move left", L"Move right", L"Remove"};
+    const int tab = plugTab;
+    showMenuList(h, rPlugPill[i], items, [h, i, tab](int k) {
+        plugins::Chain& c = plugChain(tab);
+        vst2::Plugin* p = c.at(i);
+        if (!p) return;
+        switch (k) {
+        case 0: plugToggleWindow(p); break;
+        case 1: c.setBypass(i, !c.bypassed(i)); break;
+        case 2: c.move(i, i - 1); break;
+        case 3: c.move(i, i + 1); break;
+        case 4: {
+            plugCloseWindow(p);
+            auto gone = c.remove(i);
+            gone.reset();  // stopped and let go (the audio thread no longer sees it)
+            break;
+        }
+        }
+        plugSave();
+        InvalidateRect(h, nullptr, FALSE);
+    });
+}
+
+// Pixl closing: each window closed (the plugins keep what was set in them), everything kept, then let go.
+static void plugShutdown() {
+    for (plugins::Chain* c : {&gPlugVoice, &gPlugProg})
+        for (int i = 0; i < c->size(); ++i) plugCloseWindow(c->at(i));
+    plugSave();
+    gPlugVoice.clear();
+    gPlugProg.clear();
+}
+
 static void mixAction(HWND h, int hit) {
     if (hit == MH_CLOSE) { boxClose(h); return; }
     if (hit < MH_STRIP) return;
@@ -10464,7 +10867,7 @@ static const LayoutSection SECTIONS[SEC_COUNT] = {
     {L"Voice mask", {12, VOICE_Y, COL_W - 12, VOICE_Y + VOICE_H}, 0},
     {L"Equalizer", {CX + 12, EQ_Y, CX + COL_W - 12, EQ_Y + EQ_H}, 1},
     {L"Sound clip", {CX + 12, CLIP_Y, CX + COL_W - 12, CLIP_Y + 160}, 1},
-    {L"Program on the mic", {CX + 12, CLIP_Y + 160, CX + COL_W - 12, REC_Y}, 1},
+    {L"Plugins", {CX + 12, CLIP_Y + 160, CX + COL_W - 12, REC_Y}, 1},
     {L"Recorder", {CX + 12, REC_Y, CX + COL_W - 12, CLIP_Y + CLIP_H}, 1},
 };
 static std::vector<int> layoutCols[2];
@@ -12429,7 +12832,8 @@ static void applyLayout() {
     show(hSpk, 110, TITLE_H + 48);
     show(hPreset, PRESET_X, PRESET_Y);
     show(hClipUrl, R_CLIP_URL.left, R_CLIP_URL.top);
-    show(hApp, R_APP_BOX.left, R_APP_BOX.top);
+    // The program box belongs to the Plugins panel's Program tab.
+    ShowWindow(hApp, !cablePanel && plugTab == PLUG_PROGRAM && layoutChildShown(R_APP_BOX.left, R_APP_BOX.top) ? SW_SHOW : SW_HIDE);
     show(hEqBox, R_EQ_BOX.left, R_EQ_BOX.top);
     show(hMaskBox, R_MASK_BOX.left, R_MASK_BOX.top);
     show(hOwnBox, R_OWN_BOX.left, R_OWN_BOX.top);
@@ -12497,6 +12901,10 @@ static const Hint HINTS[] = {
     {&R_APP_ONLY, HINT_MAIN, L"The program's sound stays in your headphones and never reaches the mic."},
     {&R_APP_CARD, HINT_MAIN, L"You hear the program through the virtual mic, processed like everyone else hears it."},
     {&R_APP_SELF, HINT_MAIN, L"You hear the program plainly, from the app itself."},
+    {&R_PLUG_TAB_VOICE, HINT_MAIN, L"Effects on your voice: what the mic sends, and what you hear of yourself."},
+    {&R_PLUG_TAB_PROG, HINT_MAIN, L"A program on your mic, with effects on its sound."},
+    {&R_PLUG_ON, HINT_MAIN, L"Turn every effect on your voice off and on, to compare."},
+    {&R_PLUG_FOLDER, HINT_MAIN, L"Pick a folder with more VST plugins, besides the usual ones."},
     {&R_MASK_OFF, HINT_MAIN, L"Turn the mask off."},
     {&R_PITCH, HINT_MAIN, L"Raise or lower your voice."},
     {&R_SIZE, HINT_MAIN, L"Make the voice sound bigger or smaller."},
@@ -12564,6 +12972,11 @@ static const wchar_t* tipText(UINT_PTR id, UINT flags) {
     if (i < 0 || i >= NUM_HINTS) return L"";
     const HintWhen when = HINTS[i].when;
     if (when == HINT_MAIN && cablePanel) return L"";
+    // The Plugins panel shows one tab: the other tab's controls are not there to explain.
+    const RECT* r = HINTS[i].r;
+    const bool programOnly = r == &R_APP_VOL || r == &R_APP_ONLY || r == &R_APP_CARD || r == &R_APP_SELF;
+    const bool voiceOnly = r == &R_PLUG_ON || r == &R_PLUG_FOLDER;
+    if ((programOnly && plugTab != PLUG_PROGRAM) || (voiceOnly && plugTab != PLUG_VOICE)) return L"";
     static std::wstring joined;
     joined = HINTS[i].text;
     if ((HINTS[i].r == &R_APP_CARD || HINTS[i].r == &R_APP_SELF) && gApp.chosen()) joined += std::wstring(L" ") + appRouteNote();
@@ -13074,6 +13487,11 @@ static std::vector<const RECT*> hoverables() {
         v.insert(v.end(), {&R_BOARD, &R_MIXER, &R_TONE, &R_SETUP_PREV, &R_SETUP_NEXT, &R_SAVE, &R_SETUP_DEL, &R_DEV_REFRESH, &R_ISO_PREV, &R_ISO_NEXT,
                            &R_EQ_SAVE, &R_EQ_DROP, &R_EQ_DEF, &R_CLIP_FILE, &R_CLIP_PLAY, &R_CLIP_STOP,
                            &R_CLIP_BACK, &R_CLIP_FWD, &R_MASK_OFF, &R_GLITCH, &R_GLITCH_KEY, &R_SB_UP, &R_SB_DOWN, &R_SB_TRACK});
+        v.insert(v.end(), {&R_PLUG_TAB_VOICE, &R_PLUG_TAB_PROG});
+        if (plugTab == PLUG_VOICE) v.push_back(&R_PLUG_FOLDER);
+        plugLayout();
+        for (int i = 0; i < plugPills; ++i) v.push_back(&rPlugPill[i]);
+        if (plugAddShown) v.push_back(&rPlugPill[PLUG_MAX]);
         v.insert(v.end(), {&R_REC_FROM_VOICE, &R_REC_FROM_HEAR, &R_REC_LAST_PREV, &R_REC_LAST, &R_REC_LAST_NEXT, &R_REC_LAST_QUIET, &R_REC_FX, &R_REC_QUIET, &R_REC_REDO, &R_REC_GO, &R_REC_LISTEN, &R_REC_UNDO, &R_REC_DROP, &R_REC_FIN_PREV, &R_REC_FIN, &R_REC_FIN_NEXT, &R_REC_CUT, &R_REC_KEEP, &R_REC_SEND,
                            &R_REC_SAVE, &R_REC_FOUT_PREV, &R_REC_FOUT, &R_REC_FOUT_NEXT});
     }
@@ -13805,9 +14223,10 @@ static std::vector<ValueSpot> valueSpots() {
         {K_VSPEED, after(R_VSPEED, 8, VOICE_Y + 102, 60), L"Speed (x)", SPEED_MIN / 100.0, SPEED_MAX / 100.0, 2},
         {K_CLIP_VOL, after(R_CLIP_VOL, 10, CLIP_Y + 89, 50), L"Clip volume", 0, CLIP_MAX, 0},
         {K_CLIP_SPEED, after(R_CLIP_SPEED, 10, CLIP_Y + 125, 60), L"Clip speed (x)", SPEED_MIN / 100.0, SPEED_MAX / 100.0, 2},
-        {K_APP, after(R_APP_VOL, 10, R_APP_VOL.top + 3, 50), L"Program level", 0, APP_MAX, 0},
         {K_EQ_LEVEL, RECT{EQ_LVX - 18, EQ_FT - 27, EQ_LVX + 18, EQ_FT - 7}, L"Equalizer level (dB)", -eqb::EQ_LEVEL_RANGE, 0, 0},
     };
+    // The program's level is on the Plugins panel's Program tab.
+    if (plugTab == PLUG_PROGRAM) v.push_back({K_APP, after(R_APP_VOL, 10, R_APP_VOL.top + 3, 50), L"Program level", 0, APP_MAX, 0});
     for (int k = 0; k < eqb::EQ_BANDS; ++k) {
         const int x = eqFaderX(k);
         v.push_back({K_EQ + k, RECT{x - 18, EQ_FT - 27, x + 18, EQ_FT - 7}, L"Band (dB)", -eqb::EQ_RANGE, eqb::EQ_RANGE, 0});
@@ -14262,22 +14681,40 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
+        // Plugins panel: the tabs, the effects (a click opens one's window), + Add, and the voice tab's own controls.
+        if (PtInRect(&R_PLUG_TAB_VOICE, p) || PtInRect(&R_PLUG_TAB_PROG, p)) {
+            plugTab = PtInRect(&R_PLUG_TAB_PROG, p) ? PLUG_PROGRAM : PLUG_VOICE;
+            plugNote.clear();
+            applyLayout();
+            plugSave();
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (const int e = plugPillAt(p); e >= 0) { plugToggleWindow(plugChain(plugTab).at(e)); InvalidateRect(h, nullptr, FALSE); return 0; }
+        if (plugAddShown && PtInRect(&rPlugPill[PLUG_MAX], p)) { plugAddMenu(h); return 0; }
+        if (plugTab == PLUG_VOICE && PtInRect(&R_PLUG_ON, p)) {
+            gPlugVoice.on = !gPlugVoice.on.load();
+            plugSave();
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (plugTab == PLUG_VOICE && PtInRect(&R_PLUG_FOLDER, p)) { hotLeave(h); plugPickFolder(h); InvalidateRect(h, nullptr, FALSE); return 0; }
         RECT grabApp = {R_APP_VOL.left - 8, R_APP_VOL.top - 10, R_APP_VOL.right + 8, R_APP_VOL.bottom + 10};
-        if (PtInRect(&grabApp, p)) { dragApp = true; SetCapture(h); setAppFromX(h, p.x); return 0; }
+        if (plugTab == PLUG_PROGRAM && PtInRect(&grabApp, p)) { dragApp = true; SetCapture(h); setAppFromX(h, p.x); return 0; }
         if (PtInRect(&R_CLIP_HEAR, p)) {
             g.clipHear = !g.clipHear.load();
             g.restart = true;
             settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
         }
         if (PtInRect(&R_CLIP_MIC, p)) { g.clipToMic = !g.clipToMic.load(); settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0; }
-        if (PtInRect(&R_APP_ONLY, p)) { g.appOnly = !g.appOnly.load(); appRepark(); settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0; }
-        if (PtInRect(&R_APP_CARD, p) && !g.appHear.load()) {
+        if (plugTab == PLUG_PROGRAM && PtInRect(&R_APP_ONLY, p)) { g.appOnly = !g.appOnly.load(); appRepark(); settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0; }
+        if (plugTab == PLUG_PROGRAM && PtInRect(&R_APP_CARD, p) && !g.appHear.load()) {
             g.appHear = true;
             g.restart = true;
             appRepark();
             settingsSave(); InvalidateRect(h, nullptr, FALSE); return 0;
         }
-        if (PtInRect(&R_APP_SELF, p) && g.appHear.load()) {
+        if (plugTab == PLUG_PROGRAM && PtInRect(&R_APP_SELF, p) && g.appHear.load()) {
             g.appHear = false;
             g.restart = true;
             appRepark();
@@ -14631,6 +15068,13 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_RBUTTONDOWN:
         break;
+    case WM_RBUTTONUP: {
+        // Right-click on an effect: its options.
+        const POINT p = {(short)LOWORD(l), (short)HIWORD(l)};
+        if (!cablePanel)
+            if (const int e = plugPillAt(p); e >= 0) { plugEffectMenu(h, e); return 0; }
+        break;
+    }
     case WM_LBUTTONUP:
         if (zoomDrag) {
             ReleaseCapture();
@@ -14934,6 +15378,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_ENDSESSION:
         if (w) {
+            plugShutdown();
             settingsFlush();
             presetTopKeep();
             g.quit = true;
@@ -14946,6 +15391,7 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         dockDrop();
         ghostClear();
+        plugShutdown();
         settingsFlush();
         presetTopKeep();
         g.quit = true;
@@ -15130,6 +15576,21 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
             wchar_t lay[64];
             if (GetEnvironmentVariableW(L"PIXL_LAYOUT", lay, 64)) RegSetKeyValueW(home, L"Settings", L"Layout", REG_SZ, lay, (DWORD)((wcslen(lay) + 1) * sizeof(wchar_t)));
             if (GetEnvironmentVariableW(L"PIXL_NOWALL", nullptr, 0) > 0) RegSetKeyValueW(home, L"Settings", L"Wallpaper", REG_SZ, L"", sizeof(wchar_t));
+            // PIXL_PLUGINS "tab|path|path...": the Plugins panel on that tab (0 voice, 1 program) with those effects on it.
+            static wchar_t plugs[4096];
+            if (GetEnvironmentVariableW(L"PIXL_PLUGINS", plugs, 4096)) {
+                std::vector<std::wstring> parts;
+                for (wchar_t* ctx = nullptr, *t = wcstok_s(plugs, L"|", &ctx); t; t = wcstok_s(nullptr, L"|", &ctx)) parts.push_back(t);
+                if (!parts.empty()) {
+                    const DWORD tab = parts[0] == L"1" ? 1 : 0, n = (DWORD)parts.size() - 1;
+                    const std::wstring chainName = tab ? L"Program" : L"Voice";
+                    RegSetKeyValueW(home, L"Plugins", L"Tab", REG_DWORD, &tab, sizeof tab);
+                    RegSetKeyValueW(home, L"Plugins", (chainName + L"Count").c_str(), REG_DWORD, &n, sizeof n);
+                    for (DWORD i = 0; i < n; ++i)
+                        RegSetKeyValueW(home, L"Plugins", (chainName + std::to_wstring(i) + L"Path").c_str(), REG_SZ, parts[i + 1].c_str(),
+                                        (DWORD)((parts[i + 1].size() + 1) * sizeof(wchar_t)));
+                }
+            }
             RegCloseKey(home);
             RegOverridePredefKey(HKEY_CURRENT_USER, copy);
         }
@@ -15178,6 +15639,7 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     eqUserLoad();
     eqLoad();
     settingsLoad();
+    plugLoad();    // the effects on your voice and on the program, with their settings
     layoutLoad();  // before the window size is worked out
     layoutCompute();
     {
@@ -15219,6 +15681,11 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         mx.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&mx);
         WNDCLASSW pk{}; pk.lpfnWndProc = scaledProc<pickProc>; pk.hInstance = hi; pk.lpszClassName = L"PixlPick";
         pk.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&pk);
+        WNDCLASSW ml{}; ml.lpfnWndProc = scaledProc<menuListProc>; ml.hInstance = hi; ml.lpszClassName = L"PixlMenuList";
+        ml.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&ml);
+        // A plugin draws its own window at its own size: not through Pixl's scaling.
+        WNDCLASSW pl{}; pl.lpfnWndProc = plugWindowProc; pl.hInstance = hi; pl.lpszClassName = L"PixlPlugin";
+        pl.hCursor = LoadCursor(nullptr, IDC_ARROW); pl.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); RegisterClassW(&pl);
         WNDCLASSW tr{}; tr.lpfnWndProc = scaledProc<trimProc>; tr.hInstance = hi; tr.lpszClassName = L"PixlTrim";
         tr.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&tr);
     }
