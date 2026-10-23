@@ -129,7 +129,7 @@ struct Mixer {
             s.mute = num(p + L"Mute", 0) != 0;
             s.solo = num(p + L"Solo", 0) != 0;
             s.b1 = num(p + L"B1", 0) != 0;
-            s.echo = num(p + L"Echo", 0) != 0;
+            s.echo = false;  // a program's echo is set on the Plugins panel's Program tab now, not per strip
             s.audio = num(p + L"Audio", 1) != 0;
             s.out = -1;  // no A1-A3 buttons: programs play on their usual device
             s.apps.clear();

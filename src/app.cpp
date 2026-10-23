@@ -10144,8 +10144,9 @@ static RECT mixRowCross(int i, int k) { const RECT r = mixRowRect(i, k); return 
 static RECT mixAddRect(int i) { return {mixX(i) + 8, MIX_TOP + 168, mixX(i) + MIX_SW - 8, MIX_TOP + 192}; }
 static RECT mixFaderRect(int i) { return {mixX(i) + 18, MIX_TOP + 212, mixX(i) + 50, MIX_TOP + 456}; }
 static RECT mixMeterRect(int i) { return {mixX(i) + 56, MIX_TOP + 212, mixX(i) + 64, MIX_TOP + 456}; }
+// Audio, Mic, Solo, Mute one under another (no Echo: a program's echo is set on the Plugins panel's Program tab).
 static RECT mixButton(int i, int b) {
-    const int y = MIX_TOP + 212 + (b - MS_AUDIO) * 30;
+    const int y = MIX_TOP + 212 + (b - MS_AUDIO - (b > MS_ECHO ? 1 : 0)) * 30;
     return {mixX(i) + 76, y, mixX(i) + MIX_SW - 10, y + 26};
 }
 
@@ -10278,7 +10279,6 @@ static void paintMixer(HDC dc, const RECT& rc) {
         mixText(dc, RECT{mixX(i) + 6, MIX_TOP + 462, mixX(i) + 72, MIX_TOP + 482}, db, C_TEXT, fntUI, DT_CENTER);
         iconButton(dc, mixButton(i, MS_AUDIO), ICO_SPEAKER, L"Audio", mixHot == base + MS_AUDIO, true, s.audio);
         iconButton(dc, mixButton(i, MS_B1), ICO_MIC, L"Mic", mixHot == base + MS_B1, true, s.b1);
-        iconButton(dc, mixButton(i, MS_ECHO), ICO_ROOM, L"Echo", mixHot == base + MS_ECHO, true, s.echo);
         iconButton(dc, mixButton(i, MS_SOLO), ICO_PERSON, L"Solo", mixHot == base + MS_SOLO, true, s.solo);
         iconButton(dc, mixButton(i, MS_MUTE), ICO_HUSH, L"Mute", mixHot == base + MS_MUTE, true, s.mute);
     }
@@ -10291,7 +10291,11 @@ static int mixHit(POINT p) {
         RECT r = mixAddRect(i);
         if (PtInRect(&r, p)) return base + MS_ADD;
         for (int k = 0; k < mixer::MAX_APPS; ++k) { r = mixRowCross(i, k); if (PtInRect(&r, p)) return base + MS_ROW + k; }
-        for (int b = MS_AUDIO; b <= MS_MUTE; ++b) { r = mixButton(i, b); if (PtInRect(&r, p)) return base + b; }
+        for (int b = MS_AUDIO; b <= MS_MUTE; ++b) {
+            if (b == MS_ECHO) continue;
+            r = mixButton(i, b);
+            if (PtInRect(&r, p)) return base + b;
+        }
         r = mixFaderRect(i);
         InflateRect(&r, 8, 6);
         if (PtInRect(&r, p)) return base + MS_FADER;
@@ -10918,8 +10922,6 @@ static void mixAction(HWND h, int hit) {
             if (k < (int)s.apps.size()) s.apps.erase(s.apps.begin() + k);
         } else if (b == MS_AUDIO) {
             s.audio = !s.audio;
-        } else if (b == MS_ECHO) {
-            s.echo = !s.echo;
         } else if (b == MS_B1) {
             s.b1 = !s.b1;
         } else if (b == MS_SOLO) {
