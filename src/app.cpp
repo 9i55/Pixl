@@ -10642,6 +10642,128 @@ static LRESULT CALLBACK plugWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// ---------------------------------------------------------------- Pixl's own effects: their window, in Pixl's look
+static const int FX_W = 410, FX_TOP = 14, FX_ROW = 34, FX_FOOT = 34;
+static int fxH(const pfx::Effect* fx) { return FX_TOP + fx->count() * FX_ROW + FX_FOOT; }
+static RECT fxControl(int i) { const int y = FX_TOP + i * FX_ROW; return {130, y + 5, 310, y + 27}; }
+static pfx::Effect* fxPainting = nullptr;
+static int fxDrag = -1;
+
+static void paintFx(HDC dc, const RECT& rc) {
+    HBRUSH bg = CreateSolidBrush(C_BACK);
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+    pfx::Effect* fx = fxPainting;
+    if (!fx) return;
+    panel(dc, RECT{6, 6, rc.right - 6, rc.bottom - 6}, C_PANEL, C_EDGE);
+    for (int i = 0; i < fx->count(); ++i) {
+        const pfx::Param& pr = fx->param(i);
+        const RECT c = fxControl(i);
+        label(dc, 18, c.top + 3, pr.name, C_GOLD, fntBold);
+        if (pr.curve == pfx::CHOICE) {
+            panel(dc, c, C_BACK, C_EDGE);
+            centredText(dc, RECT{c.left + 22, c.top, c.right - 22, c.bottom}, fx->text(i).c_str(), C_TEXT, fntBold);
+            centredText(dc, RECT{c.left, c.top, c.left + 22, c.bottom}, L"<", C_DIM, fntBold);
+            centredText(dc, RECT{c.right - 22, c.top, c.right, c.bottom}, L">", C_DIM, fntBold);
+        } else if (pr.curve == pfx::TOGGLE) {
+            drawCheck(dc, c.left, c.top + 4, fx->value(i) >= 0.5f, ICO_POWER, fx->value(i) >= 0.5f ? L"On" : L"Off");
+        } else {
+            drawFader(dc, c, (int)std::lround(fx->norm(i) * 1000.0f), 1000);
+            label(dc, c.right + 12, c.top + 3, fx->text(i).c_str(), C_TEXT, fntBold);
+        }
+    }
+    label(dc, 18, rc.bottom - 30, L"Right-click a control to set it back. Built into Pixl: works on every PC.", C_DIM, fntUI);
+}
+
+// A Pixl effect's window: drag a slider, click a choice (left half back, right half on), the wheel steps either.
+static LRESULT CALLBACK fxWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    auto* p = (vst2::Plugin*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    pfx::Effect* fx = p ? p->builtin() : nullptr;
+    auto rowAt = [&](POINT pt) {
+        if (!fx || pt.y < FX_TOP) return -1;
+        const int i = (pt.y - FX_TOP) / FX_ROW;
+        return i < fx->count() ? i : -1;
+    };
+    auto slideTo = [&](int i, int x) {
+        const RECT c = fxControl(i);
+        fx->setNorm(i, (float)(x - c.left - 6) / (float)std::max(1, (int)(c.right - c.left - 12)));
+    };
+    switch (m) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        fxPainting = fx;
+        paintBox(h, paintFx);
+        fxPainting = nullptr;
+        return 0;
+    case WM_PRINTCLIENT:
+        fxPainting = fx;
+        printBox(h, (HDC)w, paintFx);
+        fxPainting = nullptr;
+        return 0;
+    case WM_LBUTTONDOWN: {
+        const POINT pt = {(short)LOWORD(l), (short)HIWORD(l)};
+        const int i = rowAt(pt);
+        if (i < 0) return 0;
+        const pfx::Param& pr = fx->param(i);
+        const RECT c = fxControl(i);
+        if (pr.curve == pfx::TOGGLE) {
+            fx->setValue(i, fx->value(i) >= 0.5f ? 0.0f : 1.0f);
+            plugSave();
+        } else if (pr.curve == pfx::CHOICE) {
+            const int count = (int)pr.hi + 1, v = (int)fx->value(i);
+            fx->setValue(i, (float)(pt.x < (c.left + c.right) / 2 ? (v + count - 1) % count : (v + 1) % count));
+            plugSave();
+        } else if (pt.x >= c.left - 8 && pt.x <= c.right + 8) {
+            fxDrag = i;
+            SetCapture(h);
+            slideTo(i, pt.x);
+        }
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (fxDrag >= 0 && fx && GetCapture() == h) {
+            slideTo(fxDrag, (short)LOWORD(l));
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (fxDrag >= 0) {
+            fxDrag = -1;
+            ReleaseCapture();
+            plugSave();
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        fxDrag = -1;
+        return 0;
+    case WM_RBUTTONUP: {
+        const int i = rowAt(POINT{(short)LOWORD(l), (short)HIWORD(l)});
+        if (i >= 0) {
+            fx->reset(i);
+            plugSave();
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        const int i = rowAt(wheelPoint(h, l));
+        if (i < 0) return 0;
+        const int d = GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1;
+        const pfx::Param& pr = fx->param(i);
+        if (pr.curve == pfx::CHOICE || pr.curve == pfx::TOGGLE) fx->setValue(i, std::clamp(fx->value(i) + d, pr.lo, pr.hi));
+        else fx->setNorm(i, fx->norm(i) + d * 0.02f);
+        plugSave();
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:
+        return plugWindowProc(h, m, w, l);
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
 static void plugCloseWindow(vst2::Plugin* p) {
     if (p && p->editorWindow) SendMessageW(p->editorWindow, WM_CLOSE, 0, 0);
 }
@@ -10652,7 +10774,8 @@ static void plugToggleWindow(vst2::Plugin* p) {
     if (p->editorWindow) { plugCloseWindow(p); return; }
     if (!p->hasEditor()) { plugNote = p->title() + L" has no window of its own"; return; }
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    HWND w = CreateWindowExW(0, L"PixlPlugin", (p->title() + L" - Pixl").c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
+    const bool own = p->builtin() != nullptr;
+    HWND w = CreateWindowExW(0, own ? L"PixlFx" : L"PixlPlugin", (p->title() + L" - Pixl").c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
                              hwndMain, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!w) return;
     SetWindowLongPtrW(w, GWLP_USERDATA, (LONG_PTR)p);
@@ -10660,6 +10783,7 @@ static void plugToggleWindow(vst2::Plugin* p) {
     p->editorWindow = w;
     int ew = 0, eh = 0;
     p->openEditor(w, ew, eh);
+    if (own) { ew = sc(FX_W); eh = sc(fxH(p->builtin())); }
     RECT r{0, 0, ew, eh};
     AdjustWindowRectEx(&r, style, FALSE, 0);
     // Beside Pixl's window, on the same screen.
@@ -10719,10 +10843,16 @@ static void plugAddMenu(HWND h) {
     std::vector<std::wstring> folders = plugins::standardFolders();
     if (!plugFolder.empty()) folders.push_back(plugFolder);
     plugFound = plugins::scan(folders);
+    // Pixl's own effects first (everyone has them), then the VST plugins on this PC.
+    const auto& own = pfx::catalog();
     std::vector<std::wstring> items;
+    for (const auto& e : own) items.push_back(e.name);
     for (const auto& f : plugFound) items.push_back(f.name);
-    items.push_back(plugFound.empty() ? L"No plugins found: choose their folder..." : L"Choose another plugin folder...");
+    items.push_back(plugFound.empty() ? L"Add VST plugins from a folder..." : L"Choose another plugin folder...");
     showMenuList(h, rPlugPill[PLUG_MAX], items, [h](int k) {
+        const auto& own = pfx::catalog();
+        if (k < (int)own.size()) { plugAdd(h, plugins::Found{own[k].name, std::wstring(pfx::PREFIX) + own[k].id, L"Pixl"}); return; }
+        k -= (int)own.size();
         if (k < (int)plugFound.size()) { plugAdd(h, plugFound[k]); return; }
         if (plugPickFolder(h)) plugAddMenu(h);
         InvalidateRect(h, nullptr, FALSE);
@@ -15841,6 +15971,9 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
         // A plugin draws its own window at its own size: not through Pixl's scaling.
         WNDCLASSW pl{}; pl.lpfnWndProc = plugWindowProc; pl.hInstance = hi; pl.lpszClassName = L"PixlPlugin";
         pl.hCursor = LoadCursor(nullptr, IDC_ARROW); pl.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); RegisterClassW(&pl);
+        // Pixl's own effects draw in Pixl's look and scale.
+        WNDCLASSW fw{}; fw.lpfnWndProc = scaledProc<fxWindowProc>; fw.hInstance = hi; fw.lpszClassName = L"PixlFx";
+        fw.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&fw);
         WNDCLASSW tr{}; tr.lpfnWndProc = scaledProc<trimProc>; tr.hInstance = hi; tr.lpszClassName = L"PixlTrim";
         tr.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&tr);
     }

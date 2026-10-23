@@ -3,6 +3,7 @@
 // the format's public description: a plugin DLL exports VSTPluginMain (or main), which returns an AEffect the host
 // talks to through its dispatcher. VST2 rather than VST3: the same Kilohearts binaries carry both, and VST2 needs no
 // SDK and a few hundred lines of host, with everything a plugin offers (its own window, its parameters, its state).
+#include "pixl_effects.hpp"
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
@@ -77,8 +78,15 @@ public:
     ~Plugin() { unload(); }
 
     // Loads the DLL and starts the effect at Pixl's rate. False (with why()) when it is not a usable VST2 effect.
+    // A path like "pixl:reverb" is one of Pixl's own effects instead: nothing to load, on every PC.
     bool load(const std::wstring& file) {
         path = file;
+        if (pfx::isPixlPath(file)) {
+            fx_ = pfx::make(file);
+            name = fx_ ? fx_->name() : file.substr(5);
+            if (!fx_) { why_ = name + L" is not in this version of Pixl"; return false; }
+            return true;
+        }
         const size_t slash = file.find_last_of(L"\\/");
         name = file.substr(slash == std::wstring::npos ? 0 : slash + 1);
         const size_t dot = name.find_last_of(L'.');
@@ -117,6 +125,7 @@ public:
 
     // Stops and frees the effect (its window must be closed first).
     void unload() {
+        fx_.reset();
         if (effect_) {
             call(effStopProcess);
             call(effMainsChanged, 0, 0);
@@ -126,17 +135,20 @@ public:
         if (module_) { FreeLibrary(module_); module_ = nullptr; }
     }
 
-    bool loaded() const { return effect_ != nullptr; }
+    bool loaded() const { return effect_ != nullptr || fx_ != nullptr; }
+    // One of Pixl's own effects (its window is drawn by Pixl), else nullptr.
+    pfx::Effect* builtin() const { return fx_.get(); }
     const std::wstring& why() const { return why_; }
     // What the plugin calls itself ("Reverb"), else the file's name.
     std::wstring title() const { return displayName_.empty() ? name : displayName_; }
-    bool hasEditor() const { return effect_ && (effect_->flags & flagHasEditor); }
+    bool hasEditor() const { return fx_ || (effect_ && (effect_->flags & flagHasEditor)); }
 
     // A plugin that crashed while processing is left out from then on (Pixl keeps running).
     bool crashed() const { return crashed_.load(); }
 
     // Runs the effect on a stereo block in place (any length: longer blocks go in pieces).
     void process(float* l, float* r, int frames) {
+        if (fx_) { fx_->process(l, r, frames); return; }
         if (!effect_ || crashed_.load()) return;
         for (int done = 0; done < frames;) {
             const int n = frames - done < kMaxBlock ? frames - done : kMaxBlock;
@@ -166,6 +178,7 @@ public:
     // The plugin's own window, inside parent (size from the plugin). False when it has none.
     bool openEditor(HWND parent, int& width, int& height) {
         if (!hasEditor()) return false;
+        if (fx_) { width = height = 0; editorOpen_ = true; return true; }  // Pixl draws it
         ERect* rect = nullptr;
         call(effEditGetRect, 0, 0, &rect);
         call(effEditOpen, 0, 0, parent);
@@ -184,6 +197,12 @@ public:
     // The plugin's whole state (its chunk, or its parameters), to keep and give back later.
     std::vector<uint8_t> saveState() {
         std::vector<uint8_t> out;
+        if (fx_) {
+            out.resize(1 + (size_t)fx_->count() * sizeof(float));
+            out[0] = 'X';
+            for (int i = 0; i < fx_->count(); ++i) { const float v = fx_->value(i); memcpy(out.data() + 1 + i * sizeof(float), &v, sizeof v); }
+            return out;
+        }
         if (!effect_) return out;
         if (effect_->flags & flagProgramChunks) {
             void* data = nullptr;
@@ -203,6 +222,11 @@ public:
         return out;
     }
     void loadState(const std::vector<uint8_t>& state) {
+        if (fx_ && !state.empty() && state[0] == 'X') {
+            const int n = (int)((state.size() - 1) / sizeof(float));
+            for (int i = 0; i < n && i < fx_->count(); ++i) { float v; memcpy(&v, state.data() + 1 + i * sizeof(float), sizeof v); fx_->setValue(i, v); }
+            return;
+        }
         if (!effect_ || state.empty()) return;
         if (state[0] == 'C' && state.size() > 5) {
             int32_t size = 0;
@@ -224,6 +248,7 @@ public:
 private:
     HMODULE module_ = nullptr;
     AEffect* effect_ = nullptr;
+    std::unique_ptr<pfx::Effect> fx_;
     std::wstring why_, displayName_;
     int channels_ = 2;
     std::vector<std::vector<float>> in_, out_;
