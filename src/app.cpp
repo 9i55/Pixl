@@ -5182,7 +5182,8 @@ static RECT rPlugPill[PLUG_MAX + 1] = {};
 static int plugPills = 0;
 static bool plugAddShown = false;
 static std::wstring plugFolder;          // the user's own plugin folder, searched with the usual ones
-static std::vector<plugins::Found> plugFound;
+static plugins::Scanner plugScanner;        // the VST plugins on this PC, searched behind the window
+static const UINT WM_PLUG_READY = WM_APP + 71, WM_PLUG_SCANNED = WM_APP + 72;
 static std::wstring plugNote;            // what went wrong last (a plugin that would not load)
 
 static plugins::Chain& plugChain(int tab) { return tab == PLUG_PROGRAM ? gPlugProg : gPlugVoice; }
@@ -10633,6 +10634,25 @@ static void plugLoad() {
     RegCloseKey(k);
 }
 
+// Looks for VST plugins on a thread of its own; the window hears when it is done.
+static void plugScanStart() {
+    std::vector<std::wstring> folders = plugins::standardFolders();
+    if (!plugFolder.empty()) folders.push_back(plugFolder);
+    plugScanner.start(std::move(folders), [] { if (hwndMain) PostMessageW(hwndMain, WM_PLUG_SCANNED, 0, 0); });
+}
+
+// Saves a little after the last change, so dragging or wheeling an effect's control does not write on every step.
+static UINT_PTR plugSaveTimer = 0;
+static void CALLBACK plugSaveTick(HWND, UINT, UINT_PTR id, DWORD) {
+    KillTimer(nullptr, id);
+    plugSaveTimer = 0;
+    plugSave();
+}
+static void plugSaveSoon() {
+    if (plugSaveTimer) KillTimer(nullptr, plugSaveTimer);
+    plugSaveTimer = SetTimer(nullptr, 0, 700, plugSaveTick);
+}
+
 // A plugin's own window: its editor inside, the plugin asked to idle often (its meters and knobs move).
 static LRESULT CALLBACK plugWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto* p = (vst2::Plugin*)GetWindowLongPtrW(h, GWLP_USERDATA);
@@ -10718,11 +10738,11 @@ static LRESULT CALLBACK fxWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const RECT c = fxControl(i);
         if (pr.curve == pfx::TOGGLE) {
             fx->setValue(i, fx->value(i) >= 0.5f ? 0.0f : 1.0f);
-            plugSave();
+            plugSaveSoon();
         } else if (pr.curve == pfx::CHOICE) {
             const int count = (int)pr.hi + 1, v = (int)fx->value(i);
             fx->setValue(i, (float)(pt.x < (c.left + c.right) / 2 ? (v + count - 1) % count : (v + 1) % count));
-            plugSave();
+            plugSaveSoon();
         } else if (pt.x >= c.left - 8 && pt.x <= c.right + 8) {
             fxDrag = i;
             SetCapture(h);
@@ -10741,7 +10761,7 @@ static LRESULT CALLBACK fxWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (fxDrag >= 0) {
             fxDrag = -1;
             ReleaseCapture();
-            plugSave();
+            plugSaveSoon();
         }
         return 0;
     case WM_CAPTURECHANGED:
@@ -10751,7 +10771,7 @@ static LRESULT CALLBACK fxWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const int i = rowAt(POINT{(short)LOWORD(l), (short)HIWORD(l)});
         if (i >= 0) {
             fx->reset(i);
-            plugSave();
+            plugSaveSoon();
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -10763,7 +10783,7 @@ static LRESULT CALLBACK fxWindowProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         const pfx::Param& pr = fx->param(i);
         if (pr.curve == pfx::CHOICE || pr.curve == pfx::TOGGLE) fx->setValue(i, std::clamp(fx->value(i) + d, pr.lo, pr.hi));
         else fx->setNorm(i, fx->norm(i) + d * 0.02f);
-        plugSave();
+        plugSaveSoon();
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
@@ -10808,9 +10828,9 @@ static void plugToggleWindow(vst2::Plugin* p) {
     SetTimer(w, 1, 30, nullptr);
 }
 
-// A plugin chosen from the list: loaded, put at the end of the open tab's row, and its window opened to set it up.
-static void plugAdd(HWND h, const plugins::Found& f) {
-    plugins::Chain& c = plugChain(plugTab);
+// A plugin chosen from the list: loaded, put at the end of its tab's row, and its window opened to set it up.
+static void plugAddNow(HWND h, const plugins::Found& f, int tab) {
+    plugins::Chain& c = plugChain(tab);
     if (c.size() >= PLUG_MAX) return;
     HCURSOR was = SetCursor(LoadCursor(nullptr, IDC_WAIT));
     auto p = std::make_unique<vst2::Plugin>();
@@ -10819,10 +10839,41 @@ static void plugAdd(HWND h, const plugins::Found& f) {
     if (!ok) { plugNote = p->why(); InvalidateRect(h, nullptr, FALSE); return; }
     plugNote.clear();
     vst2::Plugin* raw = p.get();
-    c.add(std::move(p));
+    if (!c.add(std::move(p))) {
+        plugNote = L"The effects are busy for a moment: try again";
+        InvalidateRect(h, nullptr, FALSE);
+        return;
+    }
     plugSave();
     plugToggleWindow(raw);
     InvalidateRect(h, nullptr, FALSE);
+}
+
+// A VST's slow part (reading a big file, its own start-up code) happens off the window's thread, so Pixl keeps
+// answering; then it starts here, where its window will live. Pixl's own effects need none of that.
+struct PlugJob { plugins::Found f; int tab = 0; HMODULE module = nullptr; };
+static bool plugLoading = false;
+static void plugAdd(HWND h, const plugins::Found& f) {
+    if (pfx::isPixlPath(f.path)) { plugAddNow(h, f, plugTab); return; }
+    if (plugLoading) return;
+    plugLoading = true;
+    plugNote = L"Loading " + f.name + L"...";
+    InvalidateRect(h, nullptr, FALSE);
+    auto* job = new PlugJob{f, plugTab, nullptr};
+    std::thread([h, job] {
+        job->module = LoadLibraryExW(job->f.path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!PostMessageW(h, WM_PLUG_READY, 0, (LPARAM)job)) {
+            if (job->module) FreeLibrary(job->module);
+            delete job;
+        }
+    }).detach();
+}
+static void plugReady(HWND h, PlugJob* job) {
+    plugLoading = false;
+    plugNote.clear();
+    plugAddNow(h, job->f, job->tab);  // its file is already in: quick now
+    if (job->module) FreeLibrary(job->module);
+    delete job;
 }
 
 static bool plugPickFolder(HWND h) {
@@ -10842,35 +10893,50 @@ static bool plugPickFolder(HWND h) {
         }
     }
     d->Release();
-    if (picked) { plugFound.clear(); plugSave(); }
+    if (picked) { plugSave(); plugScanStart(); }
     return picked;
 }
 
-static void plugAddMenu(HWND h) {
+static bool plugAddOpen = false;  // the list showing is + Add's (a search that ends refreshes it)
+static int plugAddListed = -1;     // how many VST plugins it lists (-1: it says it is still looking)
+
+static void plugAddMenu(HWND h, bool search = true) {
     hotLeave(h);
-    // Searched each time the list opens: a few dozen files' headers, read in an instant, so new installs show at once.
-    std::vector<std::wstring> folders = plugins::standardFolders();
-    if (!plugFolder.empty()) folders.push_back(plugFolder);
-    plugFound = plugins::scan(folders);
+    // The last search shows at once; a new one runs behind it (reading only files that changed) and refreshes the list.
+    if (search) plugScanStart();
+    const std::vector<plugins::Found> found = plugScanner.found();
+    const bool looking = !plugScanner.searched();
     // Pixl's own effects first (everyone has them), then the VST plugins on this PC.
     const auto& own = pfx::catalog();
     std::vector<std::wstring> items;
     for (const auto& e : own) items.push_back(e.name);
-    for (const auto& f : plugFound) items.push_back(f.name);
-    items.push_back(plugFound.empty() ? L"Add VST plugins from a folder..." : L"Choose another plugin folder...");
-    showMenuList(h, rPlugPill[PLUG_MAX], items, [h](int k) {
+    for (const auto& f : found) items.push_back(f.name);
+    items.push_back(looking ? L"Looking for VST plugins..." : found.empty() ? L"Add VST plugins from a folder..." : L"Choose another plugin folder...");
+    showMenuList(h, rPlugPill[PLUG_MAX], items, [h, found, looking](int k) {
+        plugAddOpen = false;
         const auto& own = pfx::catalog();
         if (k < (int)own.size()) { plugAdd(h, plugins::Found{own[k].name, std::wstring(pfx::PREFIX) + own[k].id, L"Pixl"}); return; }
         k -= (int)own.size();
-        if (k < (int)plugFound.size()) { plugAdd(h, plugFound[k]); return; }
+        if (k < (int)found.size()) { plugAdd(h, found[k]); return; }
+        if (looking) return;
         if (plugPickFolder(h)) plugAddMenu(h);
         InvalidateRect(h, nullptr, FALSE);
     });
+    plugAddOpen = hMenuList != nullptr;
+    plugAddListed = looking ? -1 : (int)found.size();
+}
+
+// A search ended: the open + Add list shows what it found.
+static void plugScanned(HWND h) {
+    if (!plugAddOpen || !hMenuList) return;
+    const int now = plugScanner.searched() ? (int)plugScanner.found().size() : -1;
+    if (now != plugAddListed) plugAddMenu(h, false);
 }
 
 // Right-click on an effect: its window, on or off, its place in the row, out.
 static void plugEffectMenu(HWND h, int i) {
     hotLeave(h);
+    plugAddOpen = false;
     plugins::Chain& c = plugChain(plugTab);
     vst2::Plugin* p = c.at(i);
     if (!p) return;
@@ -14729,6 +14795,12 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_BOARD_READY:
         boardLoaded((BoardLoaded*)l);
         return 0;
+    case WM_PLUG_READY:
+        plugReady(h, (PlugJob*)l);
+        return 0;
+    case WM_PLUG_SCANNED:
+        plugScanned(h);
+        return 0;
     case WM_DEVICES_FOUND:
         devicesFound(h, l);
         return 0;
@@ -15935,6 +16007,7 @@ int WINAPI WinMain(_In_ HINSTANCE hi, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int n
     eqLoad();
     settingsLoad();
     plugLoad();    // the effects on your voice and on the program, with their settings
+    plugScanStart();  // and the VST plugins on this PC, looked for behind the window
     layoutLoad();  // before the window size is worked out
     layoutCompute();
     {
